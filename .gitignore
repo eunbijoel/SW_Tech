@@ -1,0 +1,39 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Local analysis workbooks (do not commit)
+excel/
+
+# Runtime uploads and generated results (empty or user data)
+storage/uploads/
+storage/results/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

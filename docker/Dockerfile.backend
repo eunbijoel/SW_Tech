@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for openpyxl, paramiko, etc.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/base.txt requirements/base.txt
+COPY requirements/backend.txt requirements/backend.txt
+RUN pip install --no-cache-dir -r requirements/backend.txt
+
+COPY backend/ backend/
+COPY config/ config/
+
+# Storage dirs created at runtime via settings.ensure_dirs()
+RUN mkdir -p storage/uploads storage/results/markdown storage/results/excel logs
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

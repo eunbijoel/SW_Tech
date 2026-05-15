@@ -1,0 +1,80 @@
+version: "3.9"
+
+# ── Shared networking ──────────────────────────────────────────────────────────
+networks:
+  app-net:
+    driver: bridge
+
+# ── Named volumes for persistence ─────────────────────────────────────────────
+volumes:
+  uploads:
+  results:
+  logs:
+  ollama-data:
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    image: ai-prompt-platform-backend:latest
+    container_name: app-backend
+    env_file:
+      - ../.env
+    environment:
+      - UPLOAD_DIR=/app/storage/uploads
+      - RESULTS_DIR=/app/storage/results
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - FRONTEND_URL=http://localhost:8501
+    volumes:
+      - uploads:/app/storage/uploads
+      - results:/app/storage/results
+      - logs:/app/logs
+    ports:
+      - "8000:8000"
+    networks:
+      - app-net
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    image: ai-prompt-platform-frontend:latest
+    container_name: app-frontend
+    environment:
+      - BACKEND_URL=http://backend:8000/api/v1
+    ports:
+      - "8501:8501"
+    networks:
+      - app-net
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: app-ollama
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - app-net
+    restart: unless-stopped
+    # GPU profile — activate with: docker-compose --profile gpu up
+    profiles: []
+    deploy:
+      resources:
+        reservations:
+          devices: []
