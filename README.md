@@ -1,7 +1,6 @@
 # Basic Software Technology
 
-**Streamlit + FastAPI** 로 만든 대화형 AI·엑셀 분석 플랫폼입니다.
-
+**Streamlit 기반 대화형 excel 분석 SW
 ---
 
 ## 요약
