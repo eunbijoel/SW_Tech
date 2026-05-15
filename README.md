@@ -1,6 +1,5 @@
 # Basic Software Technology
-
-**Streamlit 기반 대화형 excel 분석 SW
+Streamlit 기반 대화형 excel 분석 SW
 ---
 
 ## 요약
