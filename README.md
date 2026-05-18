@@ -1,7 +1,8 @@
 # Basic Software Technology
 
 Streamlit 기반 대화형 excel 분석 SW
----
+<img width="1903" height="894" alt="SwTech" src="https://github.com/user-attachments/assets/5acf2cb8-f0e0-4ecd-b7c3-c2822b09c202" />
+
 
 ## 요약
 
