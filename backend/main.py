@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from backend.core.config import settings
 from backend.core.logging import configure_logging, get_logger
-from backend.api.routes import chat, files, models, execution
+from backend.api.routes import chat, files, models, execution, history
 
 configure_logging()
 log = get_logger(__name__)
@@ -49,6 +49,7 @@ app.include_router(chat.router,      prefix=f"{prefix}/chat",      tags=["Chat"]
 app.include_router(files.router,     prefix=f"{prefix}/files",     tags=["Files"])
 app.include_router(models.router,    prefix=f"{prefix}/models",    tags=["Models"])
 app.include_router(execution.router, prefix=f"{prefix}/execution", tags=["Execution"])
+app.include_router(history.router,   prefix=f"{prefix}/history",   tags=["History"])
 
 
 @app.get("/health", tags=["Health"])

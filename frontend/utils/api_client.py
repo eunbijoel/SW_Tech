@@ -148,6 +148,36 @@ def spark_status() -> dict:
         return resp.json()
 
 
+# ── Chat History ─────────────────────────────────────────────────────────────
+
+def save_chat(messages: list[dict], model: str = "", chat_id: str | None = None) -> dict:
+    payload = {"messages": messages, "model": model, "chat_id": chat_id}
+    with _client() as c:
+        resp = c.post("/history/", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def list_saved_chats() -> list[dict]:
+    with _client() as c:
+        resp = c.get("/history/")
+        resp.raise_for_status()
+        return resp.json()["chats"]
+
+
+def load_chat(chat_id: str) -> dict:
+    with _client() as c:
+        resp = c.get(f"/history/{chat_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+
+def delete_saved_chat(chat_id: str) -> bool:
+    with _client() as c:
+        resp = c.delete(f"/history/{chat_id}")
+        return resp.status_code == 200
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 def backend_health() -> bool:
