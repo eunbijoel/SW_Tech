@@ -1,12 +1,10 @@
 """
-Basic Software Technology — ChatGPT/Gemini-style AI Chat
-
-Single-page interface:
-  • Dark sidebar  : new chat · model selector · file attach · saved conversations
-  • Main area     : welcome screen (no messages) or chat bubbles
-  • Bottom        : st.chat_input (always pinned)
+Streamlit AI Lab — AI Chat with Excel Analysis
 """
 from __future__ import annotations
+
+import io
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -25,10 +23,10 @@ from frontend.utils.api_client import (
 )
 from frontend.utils.session import init_session
 
-# ── Page config (must be the first Streamlit call) ───────────────────────────
+# ── Page config (must be the very first Streamlit call) ───────────────────────
 st.set_page_config(
-    page_title="Basic Software Technology",
-    page_icon="🤖",
+    page_title="Streamlit AI Lab",
+    page_icon="🧪",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -41,6 +39,8 @@ _EXTRA_DEFAULTS: dict = {
     "chat_id": None,
     "selected_files": [],
     "selected_file_names": {},
+    # file_id → {"name": str, "path": str|None, "bytes": bytes|None}
+    "selected_file_data": {},
 }
 for _k, _v in _EXTRA_DEFAULTS.items():
     if _k not in st.session_state:
@@ -50,13 +50,11 @@ for _k, _v in _EXTRA_DEFAULTS.items():
 st.markdown(
     """
 <style>
-/* ── Hide default Streamlit chrome ────────────────────────────────────── */
+/* ── Hide default Streamlit chrome ───────────────────────────────────────── */
 #MainMenu, header, footer { visibility: hidden; }
-
-/* ── Hide auto-generated page navigation ─────────────────────────────── */
 [data-testid="stSidebarNav"] { display: none; }
 
-/* ── Dark sidebar ─────────────────────────────────────────────────────── */
+/* ── Dark sidebar ─────────────────────────────────────────────────────────── */
 [data-testid="stSidebar"] {
     background-color: #171717 !important;
 }
@@ -66,15 +64,12 @@ st.markdown(
 [data-testid="stSidebar"] .stMarkdown {
     color: #d1d1d1 !important;
 }
-[data-testid="stSidebar"] hr {
-    border-color: #2e2e2e !important;
-}
+[data-testid="stSidebar"] hr { border-color: #2e2e2e !important; }
 [data-testid="stSidebar"] .stButton > button {
     background: transparent !important;
     color: #d1d1d1 !important;
     border: 1px solid #2e2e2e !important;
     border-radius: 8px !important;
-    text-align: left !important;
     transition: background 0.15s;
 }
 [data-testid="stSidebar"] .stButton > button:hover {
@@ -82,24 +77,33 @@ st.markdown(
     border-color: #444 !important;
 }
 [data-testid="stSidebar"] .stSelectbox > div,
-[data-testid="stSidebar"] .stSelectbox label {
-    color: #d1d1d1 !important;
-}
+[data-testid="stSidebar"] .stSelectbox label { color: #d1d1d1 !important; }
 
-/* ── Main content width & bottom padding (for chat_input) ─────────────── */
+/* ── Dark main area ───────────────────────────────────────────────────────── */
+section.main { background-color: #0e0e0e !important; }
 section.main .block-container {
-    max-width: 820px;
+    max-width: 900px;
     margin: 0 auto;
     padding-top: 2rem;
     padding-bottom: 110px;
 }
 
-/* ── Suggestion chip buttons ──────────────────────────────────────────── */
+/* ── Chat message text ────────────────────────────────────────────────────── */
+[data-testid="stChatMessage"] {
+    border-radius: 14px;
+    margin-bottom: 6px;
+}
+[data-testid="stChatMessage"] p,
+[data-testid="stChatMessage"] .stMarkdown {
+    color: #e8e8e8 !important;
+}
+
+/* ── Suggestion chip buttons (dark theme) ─────────────────────────────────── */
 .chip-col .stButton > button {
     border-radius: 20px !important;
-    border: 1px solid #e0e0e0 !important;
-    background: #fafafa !important;
-    color: #333 !important;
+    border: 1px solid #333 !important;
+    background: #1a1a1a !important;
+    color: #d1d1d1 !important;
     font-size: 0.88rem !important;
     padding: 0.55rem 1.1rem !important;
     width: 100%;
@@ -109,27 +113,46 @@ section.main .block-container {
     line-height: 1.4;
 }
 .chip-col .stButton > button:hover {
-    background: #f0f0f0 !important;
-    border-color: #bbb !important;
-}
-
-/* ── Chat bubbles ─────────────────────────────────────────────────────── */
-[data-testid="stChatMessage"] {
-    border-radius: 14px;
-    margin-bottom: 6px;
+    background: #252525 !important;
+    border-color: #555 !important;
 }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ── Helper functions ──────────────────────────────────────────────────────────
+# ── Cached file preview ───────────────────────────────────────────────────────
 
+@st.cache_data(ttl=300)
+def _read_preview(
+    file_id: str,
+    name: str,
+    path: Optional[str],
+    file_bytes: Optional[bytes],
+) -> tuple[Optional[pd.DataFrame], int, int]:
+    """
+    Return (first-8-rows DataFrame, total_rows, total_cols).
+    Cached per file_id so re-renders don't re-read the file.
+    """
+    try:
+        src: str | io.BytesIO = path if path else io.BytesIO(file_bytes)  # type: ignore[arg-type]
+        df = pd.read_csv(src) if name.endswith(".csv") else pd.read_excel(src)
+        return df.head(8), len(df), len(df.columns)
+    except Exception:
+        return None, 0, 0
+
+
+# ── Helper functions ──────────────────────────────────────────────────────────
 
 def _get_models() -> list[str]:
     try:
         model_map = list_models()
-        models = [m for names in model_map.values() for m in names]
+        # Ollama (local) first, then OpenAI, then Gemini
+        models = (
+            model_map.get("ollama", [])
+            + model_map.get("openai", [])
+            + model_map.get("gemini", [])
+        )
         return models or ["gpt-4o"]
     except Exception:
         return ["gpt-4o", "gemini-1.5-pro", "llama3"]
@@ -156,6 +179,7 @@ def _new_chat() -> None:
     st.session_state.chat_id = None
     st.session_state.selected_files = []
     st.session_state.selected_file_names = {}
+    st.session_state.selected_file_data = {}
 
 
 def _load_saved_chat(chat_id: str) -> None:
@@ -199,7 +223,6 @@ def _format_excel_result(result: dict) -> str:
 
 
 def _process_message(prompt: str) -> None:
-    """Append user message, call AI, render assistant bubble, update session state."""
     if not prompt.strip():
         return
 
@@ -209,7 +232,7 @@ def _process_message(prompt: str) -> None:
     selected_files: list[str] = st.session_state.get("selected_files", [])
 
     with st.chat_message("assistant"):
-        with st.spinner("생각 중…"):
+        with st.spinner(""):
             try:
                 if selected_files:
                     result = chat_excel(
@@ -236,137 +259,202 @@ def _process_message(prompt: str) -> None:
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("### 🤖 Basic Software Technology")
-    st.caption("AI 채팅 플랫폼")
+    st.markdown("### Streamlit AI Lab")
     st.divider()
 
     # ── New chat ──────────────────────────────────────────────────────────────
-    if st.button("✏️  새 채팅", use_container_width=True, type="primary"):
+    if st.button("✏️  New chat", use_container_width=True, type="primary"):
         _new_chat()
         st.rerun()
 
     st.divider()
 
     # ── Model selector ────────────────────────────────────────────────────────
-    st.markdown("**🧠 모델 선택**")
+    st.markdown("**Model**")
     available_models = _get_models()
-    current_model = st.session_state.get("selected_model", available_models[0])
-    if current_model not in available_models:
-        available_models.insert(0, current_model)
-    model_idx = available_models.index(current_model)
+    current_model = st.session_state.get("selected_model", "") or ""
+    # Default to first available model when empty or stale
+    if not current_model or current_model not in available_models:
+        current_model = available_models[0]
+        st.session_state.selected_model = current_model
 
     st.selectbox(
-        "모델",
+        "Model",
         available_models,
-        index=model_idx,
+        index=available_models.index(current_model),
         key="selected_model",
         label_visibility="collapsed",
     )
 
     st.divider()
 
-    # ── File attach ───────────────────────────────────────────────────────────
-    st.markdown("**📎 파일 첨부**")
+    # ── Attached files ────────────────────────────────────────────────────────
+    sel_files: list[str] = st.session_state.get("selected_files", [])
 
-    with st.expander("+ 파일 업로드", expanded=False):
-        raw_uploads = st.file_uploader(
-            "Excel / CSV",
-            type=["xlsx", "xls", "csv"],
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-        )
-        if raw_uploads and st.button("첨부하기", key="attach_btn"):
-            file_tuples = [(f.name, f.getvalue()) for f in raw_uploads]
-            try:
-                records = upload_files(
-                    file_tuples,
-                    session_id=st.session_state.get("session_id", ""),
-                )
-                for r in records:
-                    fid = r["id"]
-                    if fid not in st.session_state.selected_files:
-                        st.session_state.selected_files.append(fid)
-                        st.session_state.selected_file_names[fid] = r["original_name"]
-                st.success(f"{len(records)}개 파일 첨부됨")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"업로드 실패: {exc}")
+    st.markdown("**Attached files**")
+    if sel_files:
+        for fid in list(sel_files):
+            fdata = st.session_state.selected_file_data.get(fid, {})
+            fname = fdata.get("name") or st.session_state.selected_file_names.get(fid, fid[:8])
+            fpath = fdata.get("path")
+            fbytes = fdata.get("bytes")
 
-    # Library files (pre-seeded excel/ directory)
+            _, rows, cols = _read_preview(fid, fname, fpath, fbytes)
+            meta = f" ({rows}행×{cols}열)" if rows else ""
+
+            c_name, c_rm = st.columns([5, 1])
+            with c_name:
+                st.caption(f"📄 {fname}{meta}")
+            with c_rm:
+                if st.button("✕", key=f"rm_{fid}"):
+                    st.session_state.selected_files.remove(fid)
+                    st.session_state.selected_file_data.pop(fid, None)
+                    st.session_state.selected_file_names.pop(fid, None)
+                    st.rerun()
+    else:
+        st.caption("No files attached")
+
+    st.divider()
+
+    # ── Library ───────────────────────────────────────────────────────────────
     try:
         library_files = list_library_files()
     except Exception:
         library_files = []
 
     if library_files:
-        st.markdown("**📚 라이브러리**")
-        for lf in library_files:
-            fid = lf["id"]
-            is_checked = fid in st.session_state.selected_files
-            if st.checkbox(lf["original_name"], value=is_checked, key=f"lib_{fid}"):
-                if fid not in st.session_state.selected_files:
-                    st.session_state.selected_files.append(fid)
-                    st.session_state.selected_file_names[fid] = lf["original_name"]
+        st.markdown("**Library**")
+        unselected = [lf for lf in library_files if lf["id"] not in st.session_state.selected_files]
+        if unselected:
+            for lf in unselected:
+                fid = lf["id"]
+                fname = lf["original_name"]
+                c_name, c_add = st.columns([5, 1])
+                with c_name:
+                    st.caption(f"📄 {fname}")
+                with c_add:
+                    if st.button("+", key=f"add_{fid}"):
+                        st.session_state.selected_files.append(fid)
+                        st.session_state.selected_file_names[fid] = fname
+                        st.session_state.selected_file_data[fid] = {
+                            "name": fname,
+                            "path": f"excel/{fname}",
+                            "bytes": None,
+                        }
+                        st.rerun()
+        else:
+            st.caption("모든 라이브러리 파일이 첨부됨")
+
+    # ── Upload expander ───────────────────────────────────────────────────────
+    with st.expander("+ Upload file", expanded=False):
+        raw_uploads = st.file_uploader(
+            "Excel / CSV",
+            type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+        )
+        if raw_uploads and st.button("Attach", key="attach_btn"):
+            file_tuples = [(f.name, f.getvalue()) for f in raw_uploads]
+            try:
+                records = upload_files(
+                    file_tuples,
+                    session_id=st.session_state.get("session_id", ""),
+                )
+                name_to_bytes = {f.name: f.getvalue() for f in raw_uploads}
+                for r in records:
+                    fid = r["id"]
+                    fname = r["original_name"]
+                    if fid not in st.session_state.selected_files:
+                        st.session_state.selected_files.append(fid)
+                        st.session_state.selected_file_names[fid] = fname
+                        st.session_state.selected_file_data[fid] = {
+                            "name": fname,
+                            "path": None,
+                            "bytes": name_to_bytes.get(fname),
+                        }
+                st.success(f"{len(records)}개 첨부됨")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"업로드 실패: {exc}")
+
+    st.divider()
+
+    # ── Preview file ──────────────────────────────────────────────────────────
+    st.markdown("**Preview file**")
+    current_sel: list[str] = st.session_state.get("selected_files", [])
+    if current_sel:
+        id_to_name = {
+            fid: (
+                st.session_state.selected_file_data.get(fid, {}).get("name")
+                or st.session_state.selected_file_names.get(fid, fid[:8])
+            )
+            for fid in current_sel
+        }
+        preview_fid = st.selectbox(
+            "Preview file",
+            options=list(id_to_name.keys()),
+            format_func=lambda fid: id_to_name[fid],
+            label_visibility="collapsed",
+        )
+        if preview_fid:
+            pdata = st.session_state.selected_file_data.get(preview_fid, {})
+            prev_df, _, _ = _read_preview(
+                preview_fid,
+                pdata.get("name", ""),
+                pdata.get("path"),
+                pdata.get("bytes"),
+            )
+            if prev_df is not None:
+                st.dataframe(prev_df, use_container_width=True, height=220)
             else:
-                if fid in st.session_state.selected_files:
-                    st.session_state.selected_files.remove(fid)
-
-    # Show selected files summary
-    sel_files: list[str] = st.session_state.get("selected_files", [])
-    if sel_files:
-        names = [
-            st.session_state.selected_file_names.get(fid, fid[:8])
-            for fid in sel_files
-        ]
-        st.caption(f"선택됨: {', '.join(names)}")
-        if st.button("선택 해제", key="clear_files_btn"):
-            st.session_state.selected_files = []
-            st.session_state.selected_file_names = {}
-            st.rerun()
-
-    st.divider()
-
-    # ── Saved conversations ───────────────────────────────────────────────────
-    st.markdown("**💬 저장된 대화**")
-
-    try:
-        saved_chats = list_saved_chats()
-    except Exception:
-        saved_chats = []
-
-    if saved_chats:
-        for chat_meta in saved_chats[:20]:
-            cid = chat_meta["id"]
-            label = chat_meta["title"]
-            display = label[:30] + ("…" if len(label) > 30 else "")
-            c1, c2 = st.columns([5, 1])
-            with c1:
-                if st.button(display, key=f"hist_{cid}", use_container_width=True):
-                    _load_saved_chat(cid)
-                    st.rerun()
-            with c2:
-                if st.button("✕", key=f"del_{cid}"):
-                    try:
-                        delete_saved_chat(cid)
-                    except Exception:
-                        pass
-                    st.rerun()
+                st.caption("미리보기를 불러올 수 없습니다.")
     else:
-        st.caption("저장된 대화가 없습니다")
-
-    # Manual save button (only when chat is active)
-    if st.session_state.get("messages"):
-        st.divider()
-        if st.button("💾 대화 저장", use_container_width=True):
-            _save_current_chat()
-            st.success("저장됨!")
-            st.rerun()
+        st.selectbox(
+            "Preview file",
+            options=["No file selected"],
+            disabled=True,
+            label_visibility="collapsed",
+        )
 
     st.divider()
+
+    # ── Saved chats ───────────────────────────────────────────────────────────
+    with st.expander("Saved chats"):
+        try:
+            saved_chats = list_saved_chats()
+        except Exception:
+            saved_chats = []
+
+        if saved_chats:
+            for chat_meta in saved_chats[:20]:
+                cid = chat_meta["id"]
+                label = chat_meta["title"]
+                display = label[:30] + ("…" if len(label) > 30 else "")
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    if st.button(display, key=f"hist_{cid}", use_container_width=True):
+                        _load_saved_chat(cid)
+                        st.rerun()
+                with c2:
+                    if st.button("✕", key=f"del_{cid}"):
+                        try:
+                            delete_saved_chat(cid)
+                        except Exception:
+                            pass
+                        st.rerun()
+        else:
+            st.caption("저장된 대화가 없습니다")
+
+        if st.session_state.get("messages"):
+            st.divider()
+            if st.button("💾 Save chat", use_container_width=True):
+                _save_current_chat()
+                st.success("저장됨!")
+                st.rerun()
 
     # ── Backend status ────────────────────────────────────────────────────────
     healthy = backend_health()
-    st.caption(f"{'🟢' if healthy else '🔴'} 백엔드 {'온라인' if healthy else '오프라인'}")
+    st.caption(f"{'🟢' if healthy else '🔴'} Backend {'online' if healthy else 'offline'}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -395,17 +483,14 @@ SUGGESTIONS = [
 messages: list[dict] = st.session_state.get("messages", [])
 pending: str = st.session_state.get("pending_prompt", "")
 
-# ── Handle pending prompt (chip click) — BEFORE rendering welcome/history ─────
+# ── Handle chip-click prompt before rendering history ────────────────────────
 if pending:
     st.session_state.pending_prompt = ""
-    # Show existing messages first
     for msg in messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"], unsafe_allow_html=True)
-    # Show pending user message inline
     with st.chat_message("user"):
         st.markdown(pending)
-    # Get AI response and update session state
     _process_message(pending)
 
 elif not messages:
@@ -413,18 +498,17 @@ elif not messages:
     st.markdown(
         """
 <div style="text-align:center; margin-top:14vh; margin-bottom:2rem;">
-    <h1 style="font-size:2.5rem; font-weight:700; color:#1a1a1a; margin-bottom:0.4rem;">
-        Basic Software Technology
+    <h1 style="font-size:2.5rem; font-weight:700; color:#f0f0f0; margin-bottom:0.4rem;">
+        Streamlit AI Lab
     </h1>
     <p style="color:#888; font-size:1.05rem;">
-        AI에게 무엇이든 물어보세요
+        Ask me anything
     </p>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
-    # Suggestion chips (2 × 2 grid)
     col_a, col_b = st.columns(2)
     for i, (label, prompt_text) in enumerate(SUGGESTIONS):
         target_col = col_a if i % 2 == 0 else col_b
@@ -441,13 +525,8 @@ else:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"], unsafe_allow_html=True)
 
-# ── Chat input (always pinned to bottom by Streamlit) ────────────────────────
-_model_label = st.session_state.get("selected_model", "auto") or "auto"
-_sel = st.session_state.get("selected_files", [])
-_file_label = f" · 파일 {len(_sel)}개 첨부" if _sel else ""
-_placeholder = f"메시지 입력… (모델: {_model_label}{_file_label})"
-
-if user_input := st.chat_input(_placeholder):
+# ── Chat input (pinned to bottom) ─────────────────────────────────────────────
+if user_input := st.chat_input("Type your message..."):
     with st.chat_message("user"):
         st.markdown(user_input)
     _process_message(user_input)
