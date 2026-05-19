@@ -1,206 +1,188 @@
-# Basic Software Technology
+# AI Excel Agent Studio
 
-Streamlit 기반 대화형 excel 분석 SW
+Streamlit 기반 AI 엑셀 분석 도구 — Ollama 로컬 모델을 활용한 자연어 엑셀 처리·분석·병합·내보내기
 
-<img width="1903" height="894" alt="SwTech" src="https://github.com/user-attachments/assets/5acf2cb8-f0e0-4ecd-b7c3-c2822b09c202" />
+> [sayoon01/excel-agent-studio](https://github.com/sayoon01/excel-agent-studio)와 [prof-lijar/sheetpilot](https://github.com/prof-lijar/sheetpilot)의 핵심 기능을 결합하여 제작
 
----
-
-## 요약
-
-| 구분 | 설명 |
-|------|------|
-| **메인 UI** | `frontend/app.py` — **Streamlit AI Lab** (다크 채팅 + 사이드바) |
-| **보조 페이지** | `frontend/pages/` — Files / Models / Results (선택) |
-| **백엔드** | FastAPI — 채팅, 파일, 모델, 대화 이력, (선택) 원격 실행 |
-| **AI** | OpenAI · Gemini · Ollama (`AIRouter`가 모델명으로 자동 선택) |
-| **엑셀** | 프롬프트 → AI가 pandas 코드 생성 → **샌드박스**에서만 실행 |
-| **로컬 라이브러리** | `excel/` 폴더 — **읽기 전용**, UI **Library**에서 `+`로 첨부 |
-| **결과** | `.md` / 가공 `.xlsx` → `storage/results/` |
+[SCREENSHOT: 메인 채팅 화면]
 
 ---
 
-## Pipeline
+## 주요 기능
 
-로컬 `excel/` 파일이든, 업로드한 파일이든 **같은 AI 처리 파이프**로 이어집니다.
+### 1. 파일 관리
+
+- 다중 Excel/CSV 파일 업로드 (`./excel/` 폴더에 저장)
+- 파일 목록 표시 (파일명, 크기, 날짜)
+- 개별 파일 삭제
+- 사이드바에서 파일 미리보기 (상위 8행)
+- ➕/➖ 버튼으로 분석 대상 파일 첨부/해제
+
+[SCREENSHOT: 사이드바 파일 관리]
+
+### 2. AI 프롬프트 인터페이스
+
+- ChatGPT 스타일 대화형 UI
+- Ollama 로컬 서버 연결 (`http://localhost:11434`)
+- 다중 모델 지원 (qwen3-coder:30b, deepseek-coder-v2, qwen2.5:7b 등)
+- 모델 선택 드롭다운
+- 제안 칩 버튼으로 빠른 시작
+
+[SCREENSHOT: AI 채팅 대화]
+
+### 3. 자연어 엑셀 처리
+
+- **파일 병합**: 다중 엑셀 파일을 하나로 병합, 중복 컬럼 평균 처리
+- **데이터 범위**: 시트별 채워진 행/열 범위 분석
+- **계산·변환**: 집행률, 잔액 순위, 비용 분류 등 자연어 계산
+- **다단 헤더**: 한국어 예산 테이블의 병합 셀·다단 헤더 자동 감지
+- **코드 생성**: AI가 pandas 코드를 생성하고 샌드박스에서 안전하게 실행
+
+[SCREENSHOT: 엑셀 분석 결과]
+
+### 4. 결과 내보내기
+
+- 분석 결과를 새 Excel 파일로 다운로드
+- 대화 기록을 `.md` 파일로 저장
+- UI 내 다운로드 버튼
+
+### 5. 보안
+
+- AST 기반 정적 분석으로 위험 코드 차단
+- 서브프로세스 샌드박스 실행 (60초 타임아웃)
+- 금지 모듈/함수 사전 필터링 (os, sys, subprocess 등)
+
+---
+
+## 파이프라인
 
 ```mermaid
 flowchart TD
-    A["excel/ 폴더\n(라이브러리)"] --> B["file_service\nlist_library_files()"]
-    C["storage/uploads/\n(업로드)"] --> D["file_service\nlist_files()"]
-    B --> E["GET /api/v1/files/library"]
-    D --> F["GET /api/v1/files/"]
-    E --> G["api_client\nlist_library_files()"]
-    F --> H["api_client\nupload_files()"]
-    G --> I["app.py 사이드바\nLibrary + / Upload"]
-    H --> I
-    I --> J["Attached files\n(행×열 + ✕)"]
-    J --> K["Preview file\n상위 8행 dataframe"]
-    K --> L["st.chat_input\nType your message..."]
-    L --> M{"파일 첨부?"}
-    M -->|없음| N["chat_complete()\nPOST /api/v1/chat/complete"]
-    M -->|있음| O["chat_excel()\nPOST /api/v1/chat/excel"]
-    O --> P["ExcelService.process()"]
-    P --> Q["_read_file()\n다단 헤더 감지·평탄화"]
-    Q --> R["AI 코드 생성"]
-    R --> S["sandbox 실행"]
-    S --> T["결과 저장\n.md / .xlsx"]
-    N --> U["응답 표시\n+ history 저장(선택)"]
+    A["excel/ 폴더"] --> B["파일 목록"]
+    C["파일 업로드"] --> B
+    B --> D["사이드바에서 ➕ 첨부"]
+    D --> E["채팅 입력"]
+    E --> F{"파일 첨부?"}
+    F -->|없음| G["Ollama 일반 채팅"]
+    F -->|있음| H["데이터 컨텍스트 생성"]
+    H --> I["AI pandas 코드 생성"]
+    I --> J["AST 검증"]
+    J --> K["샌드박스 실행"]
+    K --> L["AI 결과 설명"]
+    L --> M["결과 표시 + 내보내기"]
+    G --> N["응답 표시"]
 ```
 
-> **참고:** `excel/`에 새 파일을 넣으면 백엔드 재시작 없이 Library 목록에 반영됩니다.
+
 
 ---
 
-## UI 구성 (`frontend/app.py`)
+## Claude Code / Codex Skill Mapping
 
-메인 화면은 **단일 채팅 페이지**입니다. Files 페이지로 가지 않아도 사이드바에서 엑셀을 붙이고 분석할 수 있습니다.
 
-```mermaid
-flowchart LR
-    subgraph Main["메인 (다크)"]
-        W["Welcome + 제안 칩"]
-        C["st.chat_message 버블"]
-        I["st.chat_input"]
-    end
-    subgraph Sidebar["사이드바"]
-        M["Model\n(ollama → openai → gemini)"]
-        A["Attached files\n이름 (Nr×Nc) + ✕"]
-        L["Library\n+ 로 첨부"]
-        U["+ Upload file"]
-        P["Preview file\n8행 미리보기"]
-        S["Saved chats\n(expander)"]
-    end
-    Sidebar --> Main
-```
+| Claude Code Skill    | 프로젝트 적용                                                    | 코드 위치                                                                              |
+| -------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **File I/O**         | Excel 업로드, 읽기(`read_excel_smart`), 쓰기(`save_result_excel`) | `app.py` — `list_excel_files()`, `read_excel_smart()`, `save_result_excel()`       |
+| **Code Generation**  | 자연어 → pandas/openpyxl 코드 생성                                | `app.py` — `generate_code_prompt()`, `extract_code_block()`                        |
+| **Data Analysis**    | 요약, 병합, 계산, 집행률 분석                                         | `app.py` — `process_excel_prompt()`, `execute_pandas_code()`                       |
+| **Conversation**     | ChatGPT 스타일 대화 UI, 대화 기록 관리                                | `app.py` — `process_message()`, `ollama_chat()`                                    |
+| **Security/Sandbox** | AST 코드 검증, 서브프로세스 격리 실행                                    | `app.py` — `_validate_code()`, `execute_pandas_code()`                             |
+| **Export**           | Excel/Markdown 결과 내보내기                                     | `app.py` — `save_result_excel()`, `save_conversation_md()`, `dataframe_to_bytes()` |
 
-| 영역 | 동작 |
-|------|------|
-| **Model** | `list_models()` — Ollama 모델 우선 정렬 |
-| **Attached files** | 첨부된 파일만 표시, `✕`로 제거 |
-| **Library** | `excel/` 파일, `+`로 첨부 (삭제 API 불가) |
-| **Upload** | `upload_files()` → uploads 저장 후 첨부 |
-| **Preview file** | 첨부 파일 중 선택 → `@st.cache_data`로 8행 표시 |
-| **채팅** | 파일 없음 → 일반 채팅 / 파일 있음 → `chat_excel` |
-
-### 보조 페이지 (`frontend/pages/`)
-
-| 페이지 | 역할 |
-|--------|------|
-| **Files** | 업로드·라이브러리·AI Excel 템플릿 (기존 워크플로) |
-| **Models** | provider 상태, Ollama pull/delete |
-| **Results** | 저장된 `.md` / `.xlsx` 조회 |
 
 ---
 
-## 라이브러리 vs 업로드
+## 기술 스택
 
-| 항목 | 라이브러리 (`excel/`) | 업로드 |
-|------|----------------------|--------|
-| 설정 | `EXCEL_LIBRARY_DIR` (`backend/core/config.py`) | `storage/uploads/` |
-| API 목록 | `GET /api/v1/files/library` | `GET /api/v1/files/` |
-| UI | Library `+` 버튼 | `+ Upload file` |
-| 삭제 | 불가 (API `403`) | `DELETE /api/v1/files/{id}` |
-| 미리보기 | `path=excel/파일명` | 업로드 바이트 또는 download URL |
 
----
+| 구분        | 기술                                    |
+| --------- | ------------------------------------- |
+| **프론트엔드** | Streamlit                             |
+| **AI**    | Ollama (로컬, `http://localhost:11434`) |
+| **엑셀 처리** | pandas, openpyxl, xlrd                |
+| **내보내기**  | openpyxl (Excel), 내장 Markdown         |
+| **코드 실행** | subprocess 샌드박스 + AST 검증              |
 
-## AI 모델 연결
-
-| 모델 이름 예시 | Provider |
-|----------------|----------|
-| `gpt-4o`, `gpt-4o-mini`, `o1-*` | OpenAI |
-| `gemini-*` | Google Gemini |
-| `llama3`, `llama3.1:*`, `qwen*` 등 | Ollama |
-
-`.env` 예시:
-
-```env
-OPENAI_API_KEY=sk-...
-GEMINI_API_KEY=AIza...
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_DEFAULT_MODEL=llama3
-```
-
-**실행 순서:** 백엔드(8000) → Streamlit(8501). 백엔드 없으면 채팅·파일 API가 실패합니다.
 
 ---
 
-## 빠른 실행
+## 빠른 시작
+
+### 사전 요구사항
+
+1. Python 3.10+
+2. [Ollama](https://ollama.ai/) 설치 및 실행
+3. 모델 다운로드:
 
 ```bash
-cd ai-prompt-platform
-cp .env.example .env   # API 키 등 입력
-pip install -r requirements/dev.txt
-bash scripts/start_dev.sh
+ollama pull qwen2.5:7b
+# 또는
+ollama pull deepseek-coder-v2
+ollama pull qwen3-coder:30b
 ```
 
-**Windows (PowerShell):**
+### 설치 및 실행
 
-```powershell
-cd C:\Users\keti\eunbi\ai-prompt-platform
-$env:PYTHONPATH = "."
-.\.venv\Scripts\python.exe -m pip install -r requirements\dev.txt
-# 터미널 1
-.\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload --port 8000
-# 터미널 2
-.\.venv\Scripts\python.exe -m streamlit run frontend\app.py
+```bash
+# 의존성 설치
+pip install -r requirements.txt
+
+# Ollama 서버 실행 (별도 터미널)
+ollama serve
+
+# 앱 실행
+streamlit run app.py
 ```
 
-| 접속 | URL |
-|------|-----|
-| **Streamlit (메인)** | http://localhost:8501 |
-| API 문서 | http://localhost:8000/api/v1/docs |
+### 접속
 
-> UI가 안 바뀌면 **8501 루트 `/`** 인지 확인하고, Streamlit을 `Ctrl+C` 후 위 명령으로 다시 실행하세요.
+
+| 서비스                       | URL                                              |
+| ------------------------- | ------------------------------------------------ |
+| **AI Excel Agent Studio** | [http://localhost:8501](http://localhost:8501)   |
+| Ollama API                | [http://localhost:11434](http://localhost:11434) |
+
+
+---
+
+## 사용 방법
+
+1. **파일 준비**: `./excel/` 폴더에 분석할 Excel 파일을 넣거나, 사이드바에서 업로드
+2. **파일 첨부**: 파일 목록에서 ➕ 버튼으로 분석할 파일을 첨부
+3. **모델 선택**: 사이드바에서 Ollama 모델 선택
+4. **자연어 입력**: 채팅창에 분석 요청 입력
+5. **결과 확인**: AI가 생성한 코드와 실행 결과 확인
+6. **내보내기**: 결과를 Excel 또는 Markdown으로 저장
+
+### 예시 프롬프트
+
+```
+첨부된 모든 엑셀 파일을 하나로 병합하고, 중복 컬럼은 평균값으로 처리해주세요.
+계획예산 대비 집행계의 집행률(%)을 계산해주세요.
+각 파일별 데이터가 채워진 행과 열의 범위를 알려주세요.
+예산잔액이 가장 큰 상위 5개 항목을 추출해주세요.
+```
 
 ---
 
 ## 프로젝트 구조
 
 ```
-ai-prompt-platform/
-├── backend/                 # FastAPI
-│   ├── main.py
-│   ├── api/routes/          # chat, files, models, history, execution
-│   └── services/            # ai/, excel_service, file_service, sandbox, …
-├── frontend/
-│   ├── app.py               # Streamlit AI Lab (메인)
-│   ├── pages/               # Files, Models, Results
-│   └── utils/api_client.py  # 백엔드 HTTP 단일 진입점
-├── excel/                   # 로컬 라이브러리 (Git 제외 권장)
-├── storage/uploads/         # 업로드 (Git 제외)
-├── storage/results/         # markdown/, excel/
-├── chat_history/            # 저장된 대화 JSON (Git 제외)
-├── docker/
-├── scripts/
-├── tests/
-├── config/settings.yaml
-├── requirements/
-└── .env.example
+SW_Tech/
+├── app.py              # AI Excel Agent Studio 메인 앱
+├── requirements.txt    # Python 의존성
+├── excel/              # Excel 파일 저장소
+│   ├── 4예실대비표.xlsx
+│   ├── 5예실대비표.xlsx
+│   └── 7예실대비표.xlsx
+├── results/            # 분석 결과 저장 (Excel, Markdown)
+├── frontend/           # 기존 Streamlit AI Lab (백엔드 연동)
+├── backend/            # 기존 FastAPI 백엔드
+└── README.md
 ```
 
 ---
 
-## 테스트
+## 원격 저장소
 
-```bash
-pip install -r requirements/dev.txt
-pytest tests/ -v
-```
-
----
-
-## Git 커밋 / 푸시
-
-`excel/`, `.venv/`, `storage/uploads/`, `storage/results/`, `chat_history/` 등은 **`.gitignore`** 로 원격에 올리지 않습니다.
-
-```powershell
-cd C:\Users\keti\eunbi\ai-prompt-platform
-git add README.md frontend/app.py
-git commit -m "docs: update README for Streamlit AI Lab UI"
-git pull origin main --no-rebase   # 원격이 앞서 있으면
-git push origin main
-```
-
-원격: https://github.com/eunbijoel/SW_Tech
+[https://github.com/eunbijoel/SW_Tech](https://github.com/eunbijoel/SW_Tech)
