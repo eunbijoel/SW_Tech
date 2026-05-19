@@ -2,12 +2,6 @@
 
 Streamlit 기반 AI 엑셀 분석 도구 — Ollama 로컬 모델을 활용한 자연어 엑셀 처리·분석·병합·내보내기
 
-> [sayoon01/excel-agent-studio](https://github.com/sayoon01/excel-agent-studio)와 [prof-lijar/sheetpilot](https://github.com/prof-lijar/sheetpilot)의 핵심 기능을 결합하여 제작
-
-[SCREENSHOT: 메인 채팅 화면]
-
----
-
 ## 주요 기능
 
 ### 1. 파일 관리
@@ -172,9 +166,6 @@ SW_Tech/
 ├── app.py              # AI Excel Agent Studio 메인 앱
 ├── requirements.txt    # Python 의존성
 ├── excel/              # Excel 파일 저장소
-│   ├── 4예실대비표.xlsx
-│   ├── 5예실대비표.xlsx
-│   └── 7예실대비표.xlsx
 ├── results/            # 분석 결과 저장 (Excel, Markdown)
 ├── frontend/           # 기존 Streamlit AI Lab (백엔드 연동)
 ├── backend/            # 기존 FastAPI 백엔드
