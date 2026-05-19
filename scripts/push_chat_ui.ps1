@@ -49,6 +49,14 @@ feat: chat history API and ChatGPT-style Streamlit UI
 - Redirect legacy Chat page to main app
 "@
 
+# Remote may have README edits from GitHub — merge before push
+Write-Host "Pulling origin/main (merge)..."
+git pull origin main --no-rebase
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Pull failed. If you see merge conflicts, fix files then: git add . ; git commit"
+    exit $LASTEXITCODE
+}
+
 git push -u origin main
 
 Write-Host "Done. See https://github.com/eunbijoel/SW_Tech"

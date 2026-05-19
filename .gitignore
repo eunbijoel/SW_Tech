@@ -29,6 +29,13 @@ excel/
 # Runtime uploads and generated results (empty or user data)
 storage/uploads/
 storage/results/
+chat_history/
+
+# SheetPilot 업로드/결과 (사용자 파일, 커밋 제외)
+uploads/*
+outputs/*
+!uploads/.gitkeep
+!outputs/.gitkeep
 
 # Logs
 logs/
