@@ -26,6 +26,11 @@ class TestDetectIntent:
             ("조건에 맞는 행을 찾아주세요", "FILTER"),
             ("차트를 그려주세요", "CHART"),
             ("그래프 시각화", "CHART"),
+            (
+                "엑셀 파일에서 문자가 입력된 범위 (라인, 컬럼) 의 갯수를 알아내줘. for each file",
+                "FILE_META",
+            ),
+            ("각 파일별로 행 열 범위만 알려줘", "FILE_META"),
             ("안녕하세요", "GENERAL"),
             ("오늘 날씨 어때?", "GENERAL"),
         ],

@@ -16,6 +16,9 @@ from services.persona_service import get_persona
 
 
 INTENT_KEYWORDS: dict[str, list[str]] = {
+    "FILE_META":  ["범위", "라인", "line", "컬럼", "column", "입력된", "채워", "비어있지",
+                    "갯수", "개수", "for each", "each file", "per file", "파일별", "각 파일",
+                    "파일 마다", "개별 파일"],
     "MERGE":      ["합치", "병합", "통합", "merge", "combine", "합쳐", "묶어"],
     "ANALYSIS":   ["분석", "analyze", "analysis", "패턴", "트렌드", "통계", "집행률"],
     "COMPARISON": ["비교", "compare", "차이", "versus", "vs", "대비"],
@@ -25,6 +28,7 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
 }
 
 _INTENT_LABELS: dict[str, str] = {
+    "FILE_META": "파일별 구조/범위",
     "MERGE": "파일 병합",
     "ANALYSIS": "데이터 분석",
     "COMPARISON": "비교 분석",
@@ -35,11 +39,37 @@ _INTENT_LABELS: dict[str, str] = {
 }
 
 
+_MERGE_KEYWORDS = ("합치", "병합", "통합", "merge", "combine", "합쳐", "묶어", "concat")
+_PER_FILE_KEYWORDS = (
+    "for each file", "each file", "per file", "파일별", "각 파일",
+    "파일 마다", "파일마다", "개별 파일", "개별적으로",
+)
+
+
+def _asks_merge(msg_lower: str) -> bool:
+    return any(kw in msg_lower for kw in _MERGE_KEYWORDS)
+
+
+def _asks_per_file(msg_lower: str, original: str) -> bool:
+    if any(kw in msg_lower for kw in _PER_FILE_KEYWORDS):
+        return True
+    return "파일별" in original or "각 파일" in original
+
+
 def detect_intent(user_message: str) -> str:
     """사용자 메시지에서 작업 의도를 감지합니다."""
     msg_lower = user_message.lower()
+
+    # 파일별·범위 질문은 병합 키워드가 없으면 MERGE/ANALYSIS보다 우선
+    if _asks_per_file(msg_lower, user_message) and not _asks_merge(msg_lower):
+        meta_score = sum(1 for kw in INTENT_KEYWORDS["FILE_META"] if kw in msg_lower)
+        if meta_score >= 1 or "for each" in msg_lower:
+            return "FILE_META"
+
     scores: dict[str, int] = {}
     for intent, keywords in INTENT_KEYWORDS.items():
+        if intent == "FILE_META":
+            continue
         score = sum(1 for kw in keywords if kw in msg_lower)
         if score > 0:
             scores[intent] = score

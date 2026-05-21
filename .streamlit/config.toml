@@ -1,3 +1,10 @@
+[server]
+port = 8502
+address = "0.0.0.0"
+
+[browser]
+serverPort = 8502
+
 [theme]
 base = "light"
 primaryColor = "#007aff"

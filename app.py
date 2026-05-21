@@ -310,6 +310,7 @@ def ollama_generate(
 # 페르소나 & 프롬프트 보강 (로컬 — 백엔드 불필요)
 # ══════════════════════════════════════════════════════════════════════════════
 from services.persona_service import get_persona, list_personas, Persona
+from services.prompt_enhancer import _asks_merge, _asks_per_file, detect_intent
 from services.prompt_enhancer import enhance as enhance_prompt, detect_intent
 
 
@@ -461,6 +462,83 @@ def file_size_fmt(size: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
+
+
+def _cell_has_value(v: Any) -> bool:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return False
+    s = str(v).strip()
+    return bool(s) and s.lower() not in ("nan", "none", "-", "—")
+
+
+def compute_filled_range_stats(df: pd.DataFrame, filename: str) -> dict[str, Any]:
+    """시트에서 값이 들어 있는 행·열 범위와 셀 개수."""
+    filled = df.map(_cell_has_value)
+    if not filled.any().any():
+        return {
+            "파일명": filename,
+            "시트_총행": len(df),
+            "시트_총열": len(df.columns),
+            "데이터_있는_행_수": 0,
+            "데이터_있는_열_수": 0,
+            "행_범위_1부터": "-",
+            "열_범위_1부터": "-",
+            "채워진_셀_수": 0,
+        }
+    row_mask = filled.any(axis=1)
+    col_mask = filled.any(axis=0)
+    row_idx = [i for i, ok in enumerate(row_mask) if ok]
+    col_idx = [i for i, ok in enumerate(col_mask) if ok]
+    return {
+        "파일명": filename,
+        "시트_총행": len(df),
+        "시트_총열": len(df.columns),
+        "데이터_있는_행_수": len(row_idx),
+        "데이터_있는_열_수": len(col_idx),
+        "행_범위_1부터": f"{row_idx[0] + 1}~{row_idx[-1] + 1}",
+        "열_범위_1부터": f"{col_idx[0] + 1}~{col_idx[-1] + 1}",
+        "채워진_셀_수": int(filled.sum().sum()),
+    }
+
+
+def _wants_chart(user_prompt: str) -> bool:
+    m = user_prompt.lower()
+    return any(k in m for k in ("차트", "그래프", "chart", "graph", "plot", "시각화", "그려"))
+
+
+def _wants_per_file_range(user_prompt: str) -> bool:
+    m = user_prompt.lower()
+    range_hints = ("범위", "라인", "line", "컬럼", "column", "행", "열", "입력", "채워", "갯수", "개수")
+    if _asks_per_file(m, user_prompt) and any(h in m for h in range_hints):
+        return True
+    return detect_intent(user_prompt) == "FILE_META"
+
+
+def try_builtin_per_file_range(
+    user_prompt: str,
+    filenames: list[str],
+    frames: dict[str, pd.DataFrame],
+) -> dict | None:
+    """파일별 입력 범위 질문은 LLM 없이 정확히 계산."""
+    if not _wants_per_file_range(user_prompt) or _asks_merge(user_prompt.lower()):
+        return None
+    rows: list[dict[str, Any]] = []
+    for i, fname in enumerate(filenames):
+        var = f"df_{i}"
+        if var not in frames:
+            continue
+        rows.append(compute_filled_range_stats(frames[var], fname))
+    if not rows:
+        return None
+    result_df = pd.DataFrame(rows)
+    shape = {"rows": len(result_df), "cols": len(result_df.columns)}
+    return {
+        "dataframe": result_df,
+        "preview": result_df.head(TABLE_PREVIEW_ROWS),
+        "shape": shape,
+        "explanation": "파일별로 입력된 행·열 범위를 계산했습니다 (데이터 병합 없음).",
+        "code": "# 내장: 파일별 입력 범위 (LLM 생략)",
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -648,16 +726,24 @@ def build_data_context(filenames: list[str]) -> tuple[str, dict[str, pd.DataFram
     return "\n".join(context_parts), frames
 
 
-def _columns_reference_block(frames: dict[str, pd.DataFrame]) -> str:
+def _columns_reference_block(
+    frames: dict[str, pd.DataFrame],
+    *,
+    allow_merge: bool = True,
+) -> str:
     """AI가 컬럼명을 오타내지 않도록 repr 문자열 목록 제공."""
     lines = ["## 사용 가능한 컬럼명 (아래 문자열을 그대로 복사 — 한자 算/산 혼동 금지)"]
     for var_name, df in frames.items():
         cols_repr = ", ".join(repr(c) for c in df.columns)
         lines.append(f"- {var_name}: {cols_repr}")
-    lines.append(
-        "- 예: `df['계획예산']` (O) / `df['계획예算']` (X — KeyError)\n"
-        "- 여러 파일 통합: `pd.concat([df_0.assign(출처='4예실'), df_1.assign(출처='5예실'), ...])`"
-    )
+    lines.append("- 예: `df['계획예산']` (O) / `df['계획예算']` (X — KeyError)")
+    if allow_merge:
+        lines.append(
+            "- 여러 파일 통합(사용자가 병합 요청한 경우만): "
+            "`pd.concat([df_0.assign(출처='파일1'), df_1.assign(출처='파일2'), ...])`"
+        )
+    else:
+        lines.append("- **이 요청에서는 pd.concat / merge / join 금지** — df_0, df_1을 각각 따로 처리.")
     return "\n".join(lines)
 
 
@@ -667,6 +753,10 @@ def generate_code_prompt(
     frame_names: list[str],
     frames: dict[str, pd.DataFrame] | None = None,
     prev_error: str | None = None,
+    *,
+    per_file_mode: bool = False,
+    allow_merge: bool = True,
+    allow_chart: bool = False,
 ) -> str:
     error_section = ""
     if prev_error:
@@ -677,6 +767,35 @@ def generate_code_prompt(
         {prev_error}
         ```
         """)
+
+    per_file_section = ""
+    if per_file_mode:
+        per_file_section = textwrap.dedent("""\
+        ## ★ 파일별 작업 (필수)
+        - 사용자는 **각 파일을 따로** 분석하라고 했습니다.
+        - `pd.concat`, `merge`, `join`으로 데이터 행을 합치지 마세요.
+        - 집행률·차트 등 **요청에 없는** 계산·시각화를 하지 마세요.
+        - `result`는 파일당 1행(또는 파일별 요약)인 표로 만드세요. `파일명` 열을 포함하세요.
+        - 예: df_0, df_1 각각에 대해 행·열 범위·채워진 셀 수를 구한 뒤 `pd.DataFrame([...])` 로 합침.
+        """)
+
+    chart_section = ""
+    if allow_chart:
+        chart_section = textwrap.dedent("""\
+        ## 시각화 규칙
+        - 차트가 필요하면 `import matplotlib.pyplot as plt` 사용
+        - 한글 폰트는 샌드박스가 자동 설정합니다. `plt.rcParams['font.family']` 를 **직접 바꾸지 마세요**
+        - 차트: `plt.figure(figsize=(10,6))` → `plt.bar(...)` 등 → `plt.savefig('__chart__.png', dpi=150, bbox_inches='tight')` → `plt.close()`
+        - 작업 디렉터리가 임시 폴더이므로 파일명 `__chart__.png` 만 사용
+        - 차트와 데이터 결과를 **둘 다** 생성하세요 (result 변수 필수)
+        - **차트 그리기 전** 반드시 `plot_df = result.dropna(subset=['집행률']).copy()` 처럼
+          **행 단위로** 결측을 제거한 뒤, `plot_df['x컬럼']`과 `plot_df['y컬럼']`을 함께 사용하세요.
+        - `plt.bar(result['A'], result['B'].dropna())` 는 **금지** (x·y 길이 불일치).
+        - 막대가 너무 많으면 상위 10~15개만: `plot_df = result.nlargest(15, '집행률')`
+        - x축 라벨이 길면 `plt.xticks(rotation=45, ha='right')` 사용
+        """)
+    else:
+        chart_section = "## 시각화\n- 사용자가 차트를 요청하지 않았습니다. **matplotlib/plt 코드를 작성하지 마세요.**\n"
 
     return textwrap.dedent(f"""\
     당신은 pandas/numpy/matplotlib 전문가입니다. 사용자의 요청을 수행하는 Python 코드를 생성하세요.
@@ -708,29 +827,14 @@ def generate_code_prompt(
       result = df.assign(집행률=...).merge(df[['집행률']])  # '집행률'은 아직 df에 없음!
       ```
 
-    ## 시각화 규칙
-    - 차트가 필요하면 `import matplotlib.pyplot as plt` 사용
-    - 한글 폰트는 샌드박스가 자동 설정합니다. `plt.rcParams['font.family']` 를 **직접 바꾸지 마세요**
-    - 차트: `plt.figure(figsize=(10,6))` → `plt.bar(...)` 등 → `plt.savefig('__chart__.png', dpi=150, bbox_inches='tight')` → `plt.close()`
-    - 작업 디렉터리가 임시 폴더이므로 파일명 `__chart__.png` 만 사용
-    - 차트와 데이터 결과를 **둘 다** 생성하세요 (result 변수 필수)
-    - **차트 그리기 전** 반드시 `plot_df = result.dropna(subset=['집행률']).copy()` 처럼
-      **행 단위로** 결측을 제거한 뒤, `plot_df['x컬럼']`과 `plot_df['y컬럼']`을 함께 사용하세요.
-    - `plt.bar(result['A'], result['B'].dropna())` 는 **금지** (x·y 길이 불일치).
-    - 막대가 너무 많으면 상위 10~15개만: `plot_df = result.nlargest(15, '집행률')`
-    - x축 라벨이 길면 `plt.xticks(rotation=45, ha='right')` 사용
-    - 예시 (올바른 코드):
-      ```
-      result['집행률'] = ...
-      plot_df = result.dropna(subset=['집행률', '비목분류']).head(15)
-      plt.bar(plot_df['비목분류'].astype(str), plot_df['집행률'])
-      ```
+    {per_file_section}
+    {chart_section}
 
     {error_section}
     ## 데이터 정보
     {data_context}
 
-    {_columns_reference_block(frames) if frames else ""}
+    {_columns_reference_block(frames, allow_merge=allow_merge) if frames else ""}
 
     ## 사용자 요청
     {user_prompt}
@@ -769,6 +873,17 @@ def process_excel_prompt(
     if not frames:
         return {"error": "첨부된 파일을 읽을 수 없습니다."}
 
+    builtin = try_builtin_per_file_range(user_prompt, filenames, frames)
+    if builtin is not None:
+        return builtin
+
+    msg_lower = user_prompt.lower()
+    allow_merge = _asks_merge(msg_lower)
+    per_file_mode = (
+        _asks_per_file(msg_lower, user_prompt) and not allow_merge
+    ) or detect_intent(user_prompt) == "FILE_META"
+    allow_chart = _wants_chart(user_prompt)
+
     prev_error: str | None = None
     last_code = ""
     attempts = max_retries + 1 if len(frames) <= 2 else 2  # 파일 3개↑면 재시도 1회만
@@ -780,6 +895,9 @@ def process_excel_prompt(
             list(frames.keys()),
             frames=frames,
             prev_error=prev_error,
+            per_file_mode=per_file_mode,
+            allow_merge=allow_merge,
+            allow_chart=allow_chart,
         )
 
         try:
