@@ -8,6 +8,8 @@ from typing import Any
 
 import streamlit as st
 
+from services.chat_catalog import format_step_select_label
+
 ROOT = Path(__file__).resolve().parent.parent
 FLOW_TEMPLATES_PATH = ROOT / "config" / "flow_templates.json"
 
@@ -43,15 +45,10 @@ def init_step_flow_state() -> None:
 def get_saved_chat_options(
     saved_chats: list[dict],
 ) -> list[tuple[str, str]]:
-    """selectbox용 (chat_filename, 표시 라벨) 목록."""
+    """selectbox용 (chat_filename, 요약 제목 라벨)."""
     options: list[tuple[str, str]] = [(FLOW_NONE, "(대화 선택)")]
     for item in saved_chats:
-        mtime = item["mtime"].strftime("%m/%d %H:%M")
-        preview = (item.get("preview") or item["name"]).strip()
-        if len(preview) > 52:
-            preview = preview[:52] + "…"
-        label = f"{mtime} · {preview}"
-        options.append((item["name"], label))
+        options.append((item["name"], format_step_select_label(item)))
     return options
 
 
@@ -67,7 +64,8 @@ def _load_flow_templates() -> list[dict]:
 def _chat_label_map(saved_chats: list[dict], options: list[tuple[str, str]]) -> dict[str, str]:
     m = {k: v for k, v in options}
     for item in saved_chats:
-        m.setdefault(item["name"], item.get("preview") or item["name"])
+        title = item.get("title") or item.get("name", "")
+        m.setdefault(item["name"], title)
     return m
 
 
