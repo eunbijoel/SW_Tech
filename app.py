@@ -13,9 +13,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import requests
@@ -79,6 +80,10 @@ _DEFAULTS: dict[str, Any] = {
     "ollama_warmed": False,
     "show_persona_form": False,
     "target_gpu_device": "GPU0 (기본)",
+    "chat_session_id": "",
+    "active_chat_file": "",
+    "pending_excel_run": None,
+    "auto_run_excel_code": False,
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -366,12 +371,49 @@ def ollama_warmup(model: str) -> None:
         pass
 
 
+from services.ollama_trace import (
+    OllamaCallResult,
+    consume_ollama_stream,
+    empty_trace_step,
+    iter_ollama_chat_stream,
+    parse_ollama_json,
+)
+from services.chat_catalog import (
+    build_chat_item,
+    chat_fingerprint,
+    dedupe_chat_items,
+    is_live_autosave_file,
+    prune_duplicate_chat_files,
+    summarize_prompt_title,
+)
+from services.conversation_store import (
+    autosave_session,
+    markdown_to_messages,
+    messages_to_markdown,
+    new_live_chat_name,
+    save_messages as save_messages_rich,
+)
+from ui.execution_trace import (
+    merge_trace_metrics,
+    model_wait_hint,
+    render_busy_timer_fragment,
+    render_execution_trace,
+    render_live_progress,
+    render_pipeline_tracker,
+    render_message_with_trace,
+    render_pending_excel_confirm,
+    start_busy_timer,
+    stop_busy_timer,
+    tokens_dict_from_result,
+)
+
+
 def ollama_chat(
     model: str,
     messages: list[dict],
     temperature: float = 0.3,
     options: dict[str, Any] | None = None,
-) -> str:
+) -> OllamaCallResult:
     opts = {**(options or OLLAMA_OPTS_CHAT), "temperature": temperature}
     payload = {
         "model": model,
@@ -380,6 +422,7 @@ def ollama_chat(
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": opts,
     }
+    t0 = time.perf_counter()
     r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
     if r.status_code != 200:
         try:
@@ -387,9 +430,219 @@ def ollama_chat(
         except Exception:
             err_msg = r.text
         raise RuntimeError(f"Ollama 오류 ({r.status_code}): {err_msg}")
-    content = r.json()["message"]["content"]
-    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content
+    wall = (time.perf_counter() - t0) * 1000
+    return parse_ollama_json(r.json(), wall_elapsed_ms=wall, model=model)
+
+
+def _likely_fast_builtin(prompt: str) -> bool:
+    """차트/그래프 요청은 제외 — LLM 코드 생성 필요."""
+    if _wants_chart(prompt):
+        return False
+    msg_lower = prompt.lower()
+    if _wants_per_file_range(prompt) and not _asks_merge(msg_lower):
+        return True
+    return _wants_execution_rate_table(prompt)
+
+
+def _wants_execution_rate_table(user_prompt: str) -> bool:
+    """집행률 **표** 전용 — 그래프/차트는 LLM matplotlib 경로."""
+    if _wants_chart(user_prompt):
+        return False
+    t = user_prompt.replace(" ", "")
+    if "집행률" not in t and "집행률" not in user_prompt:
+        return False
+    graph_hints = ("그래프", "차트", "graph", "chart", "plot", "시각화", "그려")
+    if any(h in t or h in user_prompt.lower() for h in graph_hints):
+        return False
+    return any(k in t for k in ("계획예산", "집행계", "집행", "예산"))
+
+
+def _find_column(df: pd.DataFrame, candidates: tuple[str, ...], *, exclude: tuple[str, ...] = ()) -> str | None:
+    cols = list(df.columns)
+    for cand in candidates:
+        for c in cols:
+            if cand in str(c) and not any(ex in str(c) for ex in exclude):
+                return str(c)
+    return None
+
+
+def _code_for_execution_rate_table(
+    filenames: list[str],
+    frames: dict[str, pd.DataFrame],
+) -> str | None:
+    """집행률 표용 pandas 코드 (승인 후 샌드박스 실행)."""
+    blocks: list[str] = []
+    for i, fname in enumerate(filenames):
+        var = f"df_{i}"
+        if var not in frames:
+            continue
+        df = frames[var]
+        plan_col = _find_column(df, ("계획예산",))
+        exec_col = _find_column(
+            df,
+            ("당해집행", "집행계", "집행액", "당해집행액", "합계"),
+            exclude=("전년", "계획", "예산", "이월"),
+        )
+        if not plan_col or not exec_col:
+            continue
+        extra_cols = ""
+        if "비목분류" in df.columns:
+            extra_cols += f"_b['비목분류'] = _df['비목분류'].values\n    "
+        if "비용명" in df.columns:
+            extra_cols += f"_b['비용명'] = _df['비용명'].values\n    "
+        blocks.append(textwrap.dedent(f"""\
+        _df = {var}.copy()
+        _p = pd.to_numeric(_df['{plan_col}'], errors='coerce')
+        _e = pd.to_numeric(_df['{exec_col}'], errors='coerce')
+        _b = pd.DataFrame({{
+            '파일명': ['{fname}'] * len(_df),
+            '{plan_col}': _p,
+            '{exec_col}': _e,
+        }})
+        {extra_cols}_b['집행률(%)'] = (_e / _p * 100).where(_p > 0).round(2)
+        parts.append(_b)
+        """))
+    if not blocks:
+        return None
+    return textwrap.dedent(f"""\
+    import pandas as pd
+    parts = []
+    {''.join(blocks)}
+    result = pd.concat(parts, ignore_index=True)
+    result = result.sort_values('집행률(%)', ascending=False, na_position='last')
+    """)
+
+
+def _code_for_per_file_range(
+    filenames: list[str],
+    frames: dict[str, pd.DataFrame],
+) -> str | None:
+    """파일별 범위용 pandas 코드."""
+    lines = ["import pandas as pd", "rows = []"]
+    for i, fname in enumerate(filenames):
+        var = f"df_{i}"
+        if var not in frames:
+            continue
+        lines.append(textwrap.dedent(f"""\
+        _df = {var}
+        _filled = _df.map(lambda v: v is not None and str(v).strip() not in ('', 'nan', 'None', '-', '—'))
+        _rm = _filled.any(axis=1)
+        _cm = _filled.any(axis=0)
+        _ri = [i for i, ok in enumerate(_rm) if ok]
+        _ci = [i for i, ok in enumerate(_cm) if ok]
+        rows.append({{
+            '파일명': '{fname}',
+            '시트_총행': len(_df),
+            '시트_총열': len(_df.columns),
+            '데이터_있는_행_수': len(_ri),
+            '데이터_있는_열_수': len(_ci),
+            '행_범위_1부터': f"{{_ri[0]+1}}~{{_ri[-1]+1}}" if _ri else '-',
+            '열_범위_1부터': f"{{_ci[0]+1}}~{{_ci[-1]+1}}" if _ci else '-',
+            '채워진_셀_수': int(_filled.sum().sum()),
+        }})
+        """))
+    if len(lines) <= 2:
+        return None
+    lines.append("result = pd.DataFrame(rows)")
+    return "\n".join(lines)
+
+
+def try_builtin_execution_rate_table(
+    user_prompt: str,
+    filenames: list[str],
+    frames: dict[str, pd.DataFrame],
+) -> dict | None:
+    """계획예산 대비 집행률(%) 표 — LLM 없이 즉시 계산."""
+    if not _wants_execution_rate_table(user_prompt):
+        return None
+    parts: list[pd.DataFrame] = []
+    for i, fname in enumerate(filenames):
+        var = f"df_{i}"
+        if var not in frames:
+            continue
+        df = frames[var].copy()
+        plan_col = _find_column(df, ("계획예산",))
+        exec_col = _find_column(
+            df,
+            ("당해집행", "집행계", "집행액", "당해집행액", "합계"),
+            exclude=("전년", "계획", "예산", "이월"),
+        )
+        if not plan_col or not exec_col:
+            continue
+        plan = pd.to_numeric(df[plan_col], errors="coerce")
+        spent = pd.to_numeric(df[exec_col], errors="coerce")
+        rate = (spent / plan * 100).where(plan > 0)
+        block: dict[str, Any] = {
+            "파일명": fname,
+            plan_col: plan,
+            exec_col: spent,
+            "집행률(%)": rate.round(2),
+        }
+        for extra in ("비목분류", "비용명"):
+            if extra in df.columns:
+                block[extra] = df[extra].values
+        parts.append(pd.DataFrame(block))
+
+    if not parts:
+        return None
+
+    result_df = pd.concat(parts, ignore_index=True)
+    result_df = result_df.sort_values("집행률(%)", ascending=False, na_position="last")
+    return {
+        "dataframe": result_df,
+        "preview": result_df.head(TABLE_PREVIEW_ROWS),
+        "shape": {"rows": len(result_df), "cols": len(result_df.columns)},
+        "explanation": (
+            f"계획예산 대비 집행률(%)을 {len(filenames)}개 파일에서 계산했습니다 (내장 처리, LLM 생략)."
+        ),
+        "code": "# 내장: 계획예산 대비 집행률(%)",
+    }
+
+
+def _ensure_attached_files(attached: list[str]) -> list[str]:
+    """첨부 목록이 비었으면 직전 세션 첨부를 복원."""
+    if attached:
+        st.session_state["_last_attached_files"] = list(attached)
+        return attached
+    prev = st.session_state.get("_last_attached_files") or []
+    if prev:
+        st.session_state.attached_files = list(prev)
+        return list(prev)
+    return attached
+
+
+def ollama_generate_streamed(
+    model: str,
+    prompt: str,
+    temperature: float = 0.2,
+    options: dict[str, Any] | None = None,
+) -> OllamaCallResult:
+    """코드 생성 등 장시간 작업 — 스트리밍으로 진행 표시."""
+    opts = {**(options or OLLAMA_OPTS_CODE), "temperature": temperature}
+    t0 = time.perf_counter()
+    think_lines: list[str] = []
+    code_lines: list[str] = []
+    think_box = st.expander("🧠 Thinking / 생성 중 (실시간)", expanded=True)
+    code_box = st.empty()
+
+    def on_token(role: str, text: str) -> None:
+        if role == "thinking":
+            think_lines.append(text)
+            think_box.markdown("".join(think_lines)[-4000:] or "…")
+        else:
+            code_lines.append(text)
+            code_box.code("".join(code_lines)[-12000:] or "# 생성 중…", language="python")
+
+    chunks = iter_ollama_chat_stream(
+        base_url=OLLAMA_URL,
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        options=opts,
+        keep_alive=OLLAMA_KEEP_ALIVE,
+        timeout=600,
+    )
+    wall = (time.perf_counter() - t0) * 1000
+    return consume_ollama_stream(chunks, on_token=on_token, wall_elapsed_ms=wall, model=model)
 
 
 def ollama_generate(
@@ -397,8 +650,8 @@ def ollama_generate(
     prompt: str,
     temperature: float = 0.2,
     options: dict[str, Any] | None = None,
-) -> str:
-    """단일 프롬프트를 /api/chat 으로 전송 (generate 보다 안정적)."""
+) -> OllamaCallResult:
+    """단일 프롬프트를 /api/chat 으로 전송."""
     opts = {**(options or OLLAMA_OPTS_CODE), "temperature": temperature}
     payload = {
         "model": model,
@@ -407,6 +660,7 @@ def ollama_generate(
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": opts,
     }
+    t0 = time.perf_counter()
     r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
     if r.status_code != 200:
         try:
@@ -414,10 +668,8 @@ def ollama_generate(
         except Exception:
             err_msg = r.text
         raise RuntimeError(f"Ollama 오류 ({r.status_code}): {err_msg}")
-    content = r.json()["message"]["content"]
-    # qwen3 계열은 <think>...</think> 블록을 포함할 수 있으므로 제거
-    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content
+    wall = (time.perf_counter() - t0) * 1000
+    return parse_ollama_json(r.json(), wall_elapsed_ms=wall, model=model)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -988,92 +1240,209 @@ def extract_code_block(text: str) -> str:
     return "\n".join(code_lines).strip()
 
 
-def process_excel_prompt(
-    user_prompt: str,
-    filenames: list[str],
-    model: str,
-    max_retries: int = 2,
-) -> dict:
-    """자연어 프롬프트로 엑셀 처리: 코드 생성 → 실행 → (실패 시 최대 2회 재시도) → 설명."""
-    data_context, frames = build_data_context(filenames)
-    if not frames:
-        return {"error": "첨부된 파일을 읽을 수 없습니다."}
-
-    builtin = try_builtin_per_file_range(user_prompt, filenames, frames)
-    if builtin is not None:
-        return builtin
-
+def _excel_codegen_flags(user_prompt: str) -> dict[str, bool]:
     msg_lower = user_prompt.lower()
     allow_merge = _asks_merge(msg_lower)
     per_file_mode = (
         _asks_per_file(msg_lower, user_prompt) and not allow_merge
     ) or detect_intent(user_prompt) == "FILE_META"
-    allow_chart = _wants_chart(user_prompt)
+    return {
+        "allow_merge": allow_merge,
+        "per_file_mode": per_file_mode,
+        "allow_chart": _wants_chart(user_prompt),
+    }
+
+
+def generate_excel_code_only(
+    user_prompt: str,
+    filenames: list[str],
+    model: str,
+    *,
+    thinking_steps: list[dict[str, str]] | None = None,
+    max_retries: int = 2,
+    on_progress: Callable[[str], None] | None = None,
+    use_stream: bool = True,
+) -> dict[str, Any]:
+    """코드만 생성 (실행 전). builtin은 즉시 실행 결과 포함."""
+    steps = list(thinking_steps or [])
+    if on_progress:
+        on_progress("📂 첨부 Excel 파일 읽는 중…")
+    data_context, frames = build_data_context(filenames)
+    if not frames:
+        return {"error": "첨부된 파일을 읽을 수 없습니다.", "thinking_steps": steps}
+
+    steps.append(empty_trace_step("데이터 로드", f"{len(frames)}개 DataFrame · 컨텍스트 생성"))
+    if on_progress:
+        on_progress(f"✅ {len(frames)}개 파일 로드 완료")
+    msg_lower = user_prompt.lower()
+    template_code: str | None = None
+    if _wants_per_file_range(user_prompt) and not _asks_merge(msg_lower):
+        template_code = _code_for_per_file_range(filenames, frames)
+        if template_code:
+            steps.append(empty_trace_step("코드 준비", "파일별 범위 — 템플릿 pandas (승인 후 실행)"))
+    elif _wants_execution_rate_table(user_prompt):
+        template_code = _code_for_execution_rate_table(filenames, frames)
+        if template_code:
+            steps.append(empty_trace_step("코드 준비", "집행률(%) 표 — 템플릿 pandas (승인 후 실행)"))
+    if template_code:
+        steps.append(empty_trace_step("실행 대기", "사용자 승인 후 샌드박스 실행"))
+        return {
+            "code": template_code,
+            "frames": frames,
+            "filenames": filenames,
+            "thinking_steps": steps,
+            "ollama_calls": [],
+            "code_source": "template",
+        }
+
+    flags = _excel_codegen_flags(user_prompt)
+    steps.append(empty_trace_step(
+        "규칙 적용",
+        f"merge={flags['allow_merge']} · per_file={flags['per_file_mode']} · chart={flags['allow_chart']}",
+    ))
 
     prev_error: str | None = None
     last_code = ""
-    attempts = max_retries + 1 if len(frames) <= 2 else 2  # 파일 3개↑면 재시도 1회만
+    ollama_calls: list[OllamaCallResult] = []
+    attempts = max_retries + 1 if len(frames) <= 2 else 2
+    exec_result: dict[str, Any] = {}
 
     for attempt in range(attempts):
+        steps.append(empty_trace_step("코드 생성 LLM", f"시도 {attempt + 1}/{attempts}"))
         code_prompt = generate_code_prompt(
             user_prompt,
             data_context,
             list(frames.keys()),
             frames=frames,
             prev_error=prev_error,
-            per_file_mode=per_file_mode,
-            allow_merge=allow_merge,
-            allow_chart=allow_chart,
+            per_file_mode=flags["per_file_mode"],
+            allow_merge=flags["allow_merge"],
+            allow_chart=flags["allow_chart"],
         )
-
         try:
-            raw_code = ollama_generate(
+            if on_progress:
+                on_progress(f"🤖 코드 생성 LLM ({model}) — 시도 {attempt + 1}/{attempts}")
+            # 스트리밍은 일부 환경에서 멈춤 — 기본은 비스트리밍(안정)
+            gen = ollama_generate(
                 model, code_prompt, temperature=0.1, options=OLLAMA_OPTS_CODE,
             )
+            ollama_calls.append(gen)
+            if on_progress:
+                on_progress(f"✅ 코드 수신 ({gen.elapsed_ms:.0f}ms)")
         except Exception as e:
             hint = ""
             err = str(e).lower()
             if "memory" in err or "system memory" in err:
                 hint = " 사이드바에서 **qwen2.5:7b** 등 작은 모델을 선택하세요."
-            return {"error": f"AI 코드 생성 실패: {e}{hint}"}
+            return {"error": f"AI 코드 생성 실패: {e}{hint}", "thinking_steps": steps}
 
-        code = extract_code_block(raw_code)
+        code = extract_code_block(gen.content)
         if not code:
-            return {"error": "AI가 유효한 코드를 생성하지 못했습니다.", "raw": raw_code}
-
+            return {
+                "error": "AI가 유효한 코드를 생성하지 못했습니다.",
+                "raw": gen.content,
+                "thinking_steps": steps,
+                "ollama_calls": ollama_calls,
+            }
         last_code = code
+        steps.append(empty_trace_step("코드 추출", f"{len(code.splitlines())}줄"))
+        steps.append(empty_trace_step("실행 대기", "사용자 승인 후 샌드박스 실행"))
+        if attempt == 0:
+            return {
+                "code": code,
+                "frames": frames,
+                "filenames": filenames,
+                "flags": flags,
+                "data_context": data_context,
+                "thinking_steps": steps,
+                "ollama_calls": ollama_calls,
+                "gen_thinking": gen.thinking,
+                "code_source": "llm",
+            }
         exec_result = execute_pandas_code(code, frames)
-
         if "error" not in exec_result:
             break
         prev_error = f"코드:\n{code}\n\n오류:\n{exec_result['error']}"
-    else:
-        return {**exec_result, "code": last_code}
+        steps.append(empty_trace_step("실행 실패", exec_result["error"][:200]))
+
+    return {**exec_result, "code": last_code, "thinking_steps": steps, "ollama_calls": ollama_calls}
+
+
+def execute_prepared_excel_code(
+    code: str,
+    frames: dict[str, pd.DataFrame],
+    user_prompt: str,
+    model: str,
+    *,
+    thinking_steps: list[dict[str, str]] | None = None,
+    ollama_calls: list[OllamaCallResult] | None = None,
+) -> dict[str, Any]:
+    """확인 후 샌드박스 실행 + 설명."""
+    steps = list(thinking_steps or [])
+    steps.append(empty_trace_step("AST 검증", "위험 모듈·eval 차단"))
+    t0 = time.perf_counter()
+    exec_result = execute_pandas_code(code, frames)
+    sandbox_ms = (time.perf_counter() - t0) * 1000
+    steps.append(empty_trace_step(
+        "샌드박스 실행",
+        "성공" if "error" not in exec_result else exec_result.get("error", "")[:120],
+    ))
+
+    if "error" in exec_result:
+        return {**exec_result, "code": code, "thinking_steps": steps, "sandbox_ms": sandbox_ms}
 
     explanation = ""
+    explain_call: OllamaCallResult | None = None
     if not st.session_state.get("fast_mode", True):
         try:
             explain_prompt = (
                 f"다음 pandas 실행 결과를 한국어 3문장으로 요약하세요.\n"
                 f"결과 shape: {exec_result.get('shape', exec_result.get('scalar', 'N/A'))}\n"
             )
-            explanation = ollama_generate(
+            explain_call = ollama_generate(
                 model, explain_prompt, temperature=0.3, options=OLLAMA_OPTS_EXPLAIN,
             )
+            explanation = explain_call.content
+            steps.append(empty_trace_step("결과 설명 LLM", explain_call.usage_summary()))
         except Exception:
             explanation = "설명 생성을 건너뛰었습니다."
-    else:
-        if "shape" in exec_result:
-            explanation = (
-                f"표 결과 {exec_result['shape']['rows']}행 × "
-                f"{exec_result['shape']['cols']}열 (빠른 모드: LLM 설명 생략)"
-            )
+    elif "shape" in exec_result:
+        explanation = (
+            f"표 결과 {exec_result['shape']['rows']}행 × "
+            f"{exec_result['shape']['cols']}열 (빠른 모드: LLM 설명 생략)"
+        )
 
-    retry_note = ""
-    if prev_error:
-        retry_note = f"\n\n_🔄 자동 재시도로 오류를 수정했습니다 (시도 {attempt + 1}회)_"
+    calls = list(ollama_calls or [])
+    if explain_call:
+        calls.append(explain_call)
+    return {
+        **exec_result,
+        "code": code,
+        "explanation": explanation,
+        "thinking_steps": steps,
+        "ollama_calls": calls,
+        "sandbox_ms": sandbox_ms,
+    }
 
-    return {**exec_result, "code": code, "explanation": explanation + retry_note}
+
+def process_excel_prompt(
+    user_prompt: str,
+    filenames: list[str],
+    model: str,
+    max_retries: int = 2,
+) -> dict:
+    """레거시 일괄 처리 (확인 없이)."""
+    gen = generate_excel_code_only(user_prompt, filenames, model, max_retries=max_retries)
+    if gen.get("error"):
+        return gen
+    return execute_prepared_excel_code(
+        gen["code"],
+        gen["frames"],
+        user_prompt,
+        model,
+        thinking_steps=gen.get("thinking_steps"),
+        ollama_calls=gen.get("ollama_calls"),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1086,58 +1455,86 @@ def save_result_excel(df: pd.DataFrame, name: str) -> Path:
     return path
 
 
+def _ensure_chat_session() -> str:
+    if not st.session_state.get("chat_session_id"):
+        st.session_state.chat_session_id = str(uuid.uuid4())
+    if not st.session_state.get("active_chat_file"):
+        st.session_state.active_chat_file = new_live_chat_name(st.session_state.chat_session_id)
+    return st.session_state.active_chat_file
+
+
+def _chat_summary_title(messages: list[dict]) -> str:
+    from services.chat_catalog import first_user_prompt_from_messages
+
+    prompt = first_user_prompt_from_messages(messages)
+    return summarize_prompt_title(prompt)
+
+
+def _autosave_messages(messages: list[dict]) -> Path | None:
+    if not messages:
+        return None
+    live = _ensure_chat_session()
+    title = _chat_summary_title(messages)
+    path = save_messages_rich(
+        messages,
+        live,
+        results_dir=RESULTS_DIR,
+        summary_title=title,
+    )
+    st.session_state["_last_saved_chat"] = str(path)
+    return path
+
+
+def _find_snapshot_for_fingerprint(fp: str) -> Path | None:
+    """동일 주제의 기존 스냅샷 (chat_*.md, live 제외)."""
+    if not fp:
+        return None
+    for item in list_saved_chats(limit=80, dedupe=False):
+        if is_live_autosave_file(item["name"]):
+            continue
+        if item.get("fingerprint") == fp:
+            return Path(item["path"])
+    return None
+
+
 def save_conversation_md(messages: list[dict], name: str) -> Path:
-    path = RESULTS_DIR / f"{name}.md"
-    lines = [f"# AI Excel Agent Studio 대화 기록\n",
-             f"생성일: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n---\n"]
-    for msg in messages:
-        role = "👤 사용자" if msg["role"] == "user" else "🤖 AI"
-        lines.append(f"\n## {role}\n\n{msg['content']}\n")
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path.resolve()
+    """수동 저장 — trace 포함 MD. 동일 주제면 기존 파일 갱신."""
+    title = _chat_summary_title(messages)
+    fp = chat_fingerprint(messages)
+    existing = _find_snapshot_for_fingerprint(fp)
+    if existing and not is_live_autosave_file(existing.name):
+        return save_messages_rich(
+            messages,
+            existing.name,
+            results_dir=RESULTS_DIR,
+            summary_title=title,
+        )
+    if not name.endswith(".md"):
+        name = f"{name}.md"
+    return save_messages_rich(
+        messages,
+        name,
+        results_dir=RESULTS_DIR,
+        summary_title=title,
+    )
 
 
-def _chat_preview_line(path: Path, max_len: int = 72) -> str:
-    try:
-        for m in load_conversation_md(path):
-            if m.get("role") == "user":
-                text = m.get("content", "").strip().replace("\n", " ")
-                if text:
-                    return text[:max_len] + ("…" if len(text) > max_len else "")
-    except Exception:
-        pass
-    return ""
-
-
-def list_saved_chats(limit: int = 30) -> list[dict]:
-    """results/ 아래 chat_*.md 목록 (최신순)."""
+def list_saved_chats(limit: int = 30, *, dedupe: bool = True) -> list[dict]:
+    """results/ 아래 저장 대화 (live 자동저장 파일 제외, 중복 제거)."""
     items: list[dict] = []
     for p in RESULTS_DIR.glob("chat_*.md"):
-        stat = p.stat()
-        items.append({
-            "name": p.name,
-            "path": p.resolve(),
-            "mtime": datetime.datetime.fromtimestamp(stat.st_mtime),
-            "size": stat.st_size,
-            "preview": _chat_preview_line(p),
-        })
-    items.sort(key=lambda x: x["mtime"], reverse=True)
+        row = build_chat_item(p, load_messages_fn=load_conversation_md)
+        if row:
+            items.append(row)
+    if dedupe and items:
+        prune_duplicate_chat_files(items, results_dir=RESULTS_DIR)
+        items = dedupe_chat_items(items)
     return items[:limit]
 
 
 def load_conversation_md(path: Path) -> list[dict]:
-    """저장된 .md 대화를 messages 형식으로 복원."""
-    text = path.read_text(encoding="utf-8")
-    messages: list[dict] = []
-    parts = re.split(r"^## (👤 사용자|🤖 AI)\s*\n", text, flags=re.MULTILINE)
-    for i in range(1, len(parts), 2):
-        label = parts[i]
-        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
-        if not content:
-            continue
-        role = "user" if "사용자" in label else "assistant"
-        messages.append({"role": role, "content": content})
-    return messages
+    """저장된 .md 대화를 messages 형식으로 복원 (trace 포함)."""
+    return markdown_to_messages(path.read_text(encoding="utf-8"))
 
 
 def dataframe_to_bytes(df: pd.DataFrame) -> bytes:
@@ -1231,12 +1628,195 @@ def _build_files_metadata(filenames: list[str]) -> list[dict]:
     return meta
 
 
+def _sum_ollama_calls(calls: list[OllamaCallResult]) -> dict[str, Any]:
+    prompt_t = sum(c.prompt_tokens for c in calls)
+    comp_t = sum(c.completion_tokens for c in calls)
+    elapsed = sum(c.elapsed_ms for c in calls)
+    thinking = "\n\n---\n\n".join(c.thinking for c in calls if c.thinking)
+    return {
+        "tokens": {"prompt": prompt_t, "completion": comp_t, "total": prompt_t + comp_t},
+        "elapsed_ms": elapsed,
+        "thinking": thinking,
+    }
+
+
+def _prepare_enhancement(
+    prompt: str,
+    *,
+    attached: list[str],
+    persona_id: str,
+    use_enh: bool,
+    custom_sp: str,
+) -> tuple[str, str, dict, list[dict[str, str]], PersonaRecord | Any, str]:
+    """enhanced_prompt, info, meta, thinking_steps, persona_rec, system_prompt."""
+    steps: list[dict[str, str]] = []
+    persona_rec = get_selected_persona(persona_id)
+    system_prompt = ""
+    enhanced_prompt = ""
+    enhancement_info = ""
+    enhancement_meta: dict = {}
+
+    if not use_enh:
+        persona = get_persona(persona_id)
+        system_prompt = custom_sp.strip() or persona.system_prompt
+        steps.append(empty_trace_step("프롬프트 보강", "OFF — 기본 system prompt 사용"))
+        return enhanced_prompt, enhancement_info, enhancement_meta, steps, persona_rec, system_prompt
+
+    files_meta = _build_files_metadata(attached) if attached else []
+    steps.append(empty_trace_step("페르소나 로드", f"{persona_rec.emoji} {persona_rec.name}"))
+    if custom_sp.strip():
+        persona_rec = PersonaRecord(
+            id=persona_rec.id,
+            name=persona_rec.name,
+            emoji=persona_rec.emoji,
+            description=persona_rec.description,
+            system_prompt=custom_sp.strip(),
+            response_style=persona_rec.response_style,
+            tools=persona_rec.tools,
+            task_hints=persona_rec.task_hints,
+            builtin=persona_rec.builtin,
+            created_at=persona_rec.created_at,
+            updated_at=persona_rec.updated_at,
+        )
+    if attached:
+        enh = enhance_prompt(
+            user_message=prompt,
+            persona_id=persona_id,
+            files_metadata=files_meta,
+            custom_system_prompt=custom_sp if custom_sp.strip() else None,
+        )
+        enhanced_prompt = enh["enhanced_prompt"]
+        enhancement_info = enh["enhancement_log"]
+        enhancement_meta = {
+            "persona_emoji": persona_rec.emoji,
+            "persona_name": persona_rec.name,
+            "detected_intent": enh["detected_intent"],
+        }
+        steps.append(empty_trace_step("의도 감지", enh["detected_intent"]))
+        steps.append(empty_trace_step("프롬프트 보강", "첨부 파일 메타 + Persona 블록 결합"))
+    else:
+        enhanced_prompt = build_enhanced_prompt(prompt, persona_rec, files_metadata=files_meta)
+        enhancement_meta = build_enhancement_meta(prompt, persona_rec, files_metadata=files_meta)
+        enhancement_info = (
+            f"페르소나: {persona_rec.emoji} {persona_rec.name} | "
+            f"의도: {enhancement_meta.get('detected_intent', '')}"
+        )
+        steps.append(empty_trace_step("의도 감지", enhancement_meta.get("detected_intent", "")))
+        steps.append(empty_trace_step("프롬프트 보강", "Persona enhanced prompt 생성"))
+
+    st.session_state.last_enhanced_prompt = enhanced_prompt
+    st.session_state.last_enhancement_meta = enhancement_meta
+    return enhanced_prompt, enhancement_info, enhancement_meta, steps, persona_rec, system_prompt
+
+
+def _append_processing_turn(trace: dict[str, Any]) -> None:
+    """처리 중 placeholder — UI가 멈춘 것처럼 보이지 않게."""
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": "⏳ **처리 중입니다…** (진행 상황은 아래를 확인하세요)",
+        "trace": {**trace, "status": "processing"},
+        "trace_expanded": True,
+        "_processing": True,
+    })
+
+
+def _append_assistant_turn(content: str, trace: dict[str, Any]) -> None:
+    msg = {
+        "role": "assistant",
+        "content": content,
+        "trace": trace,
+        "trace_expanded": False,
+    }
+    if st.session_state.messages and st.session_state.messages[-1].get("_processing"):
+        st.session_state.messages[-1] = msg
+    else:
+        st.session_state.messages.append(msg)
+    _autosave_messages(st.session_state.messages)
+
+
+def _complete_excel_run(
+    pending: dict[str, Any],
+    *,
+    result: dict[str, Any],
+    extra_steps: list[dict[str, str]] | None = None,
+) -> None:
+    """실행 완료 후 assistant 메시지·차트·저장."""
+    steps = list(pending.get("trace", {}).get("thinking_steps") or [])
+    if extra_steps:
+        steps.extend(extra_steps)
+    calls = list(pending.get("ollama_calls") or [])
+    calls.extend(result.get("ollama_calls") or [])
+    metrics = _sum_ollama_calls(calls)
+    sandbox_ms = float(result.get("sandbox_ms") or 0)
+    trace = merge_trace_metrics({
+        **pending.get("trace", {}),
+        "thinking_steps": steps + list(result.get("thinking_steps") or []),
+        "generated_code": result.get("code") or pending.get("code"),
+        "tokens": metrics["tokens"],
+        "thinking": metrics.get("thinking") or pending.get("trace", {}).get("thinking", ""),
+        "status": "completed",
+    }, extra_ms=sandbox_ms)
+    if metrics.get("elapsed_ms"):
+        trace["elapsed_ms"] = float(trace.get("elapsed_ms") or 0) + metrics["elapsed_ms"]
+
+    content = format_result(result)
+    chart_bytes = result.get("chart_bytes")
+    if result.get("dataframe") is not None:
+        st.session_state["_last_result_df"] = result["dataframe"]
+    if chart_bytes:
+        st.session_state["_last_chart"] = chart_bytes
+
+    trace["pipeline_stage"] = "result"
+    _append_assistant_turn(content, trace)
+    st.session_state.pending_excel_run = None
+
+
+def handle_pending_excel_action() -> bool:
+    """확인/취소 버튼 처리. 처리했으면 True."""
+    action = st.session_state.pop("_excel_confirm_action", None)
+    pending = st.session_state.get("pending_excel_run")
+    if not action or not pending:
+        return False
+
+    if action == "cancel":
+        trace = {**pending.get("trace", {}), "status": "cancelled"}
+        _append_assistant_turn("실행이 취소되었습니다.", trace)
+        st.session_state.pending_excel_run = None
+        return True
+
+    model = pending["model"]
+    start_busy_timer("코드 실행")
+    try:
+        with st.chat_message("assistant"):
+            trace = dict(pending.get("trace") or {})
+            render_live_progress(trace, current_step="샌드박스 실행 중")
+            with st.status("pandas 코드 실행 중…", expanded=True) as run_st:
+                run_st.write("AST 검증 → subprocess 샌드박스 (최대 60초)")
+                render_pipeline_tracker("run")
+                result = execute_prepared_excel_code(
+                        pending["code"],
+                        pending["frames"],
+                        pending["user_prompt"],
+                        model,
+                        thinking_steps=trace.get("thinking_steps"),
+                        ollama_calls=pending.get("ollama_calls"),
+                    )
+                run_st.update(label="실행 완료", state="complete")
+        _complete_excel_run(pending, result=result)
+    finally:
+        stop_busy_timer()
+    return True
+
+
 def process_message(prompt: str) -> None:
-    """사용자 메시지를 처리하고 AI 응답을 생성합니다."""
+    """사용자 메시지 처리 — trace 표시, 엑셀은 코드 확인 후 실행."""
     if not prompt.strip():
         return
+    if st.session_state.get("pending_excel_run"):
+        st.warning("코드 실행 확인이 끝난 뒤에 다음 메시지를 보내주세요.")
+        return
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    t_turn = time.perf_counter()
     available_models = ollama_models()
     requested_model = st.session_state.get("selected_model", "")
     hw_snap = _cached_snapshot("/", str(PROJECT_ROOT))
@@ -1244,91 +1824,235 @@ def process_message(prompt: str) -> None:
     model_switched = requested_model and model != requested_model
     if model_switched:
         st.session_state.selected_model = model
-    attached = st.session_state.get("attached_files", [])
+
+    attached = _ensure_attached_files(st.session_state.get("attached_files", []))
+    if not attached:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        _append_assistant_turn(
+            "⚠️ 첨부된 Excel 파일이 없습니다. 사이드바 **📁 Excel · 파일**에서 **➕ 첨부** 후 다시 시도하세요.",
+            {"user_prompt": prompt, "status": "error"},
+        )
+        return
     persona_id = st.session_state.get("persona_id", "general")
     use_enh = st.session_state.get("use_enhancement", True)
     custom_sp = st.session_state.get("custom_system_prompt", "")
-
-    # 프롬프트 보강
-    enhancement_info = ""
-    enhanced_prompt = ""
-    enhancement_meta: dict = {}
-    persona_rec = get_selected_persona(persona_id)
     st.session_state.last_user_prompt = prompt
 
-    if use_enh:
-        files_meta = _build_files_metadata(attached) if attached else []
-        if custom_sp.strip():
-            persona_rec = PersonaRecord(
-                id=persona_rec.id,
-                name=persona_rec.name,
-                emoji=persona_rec.emoji,
-                description=persona_rec.description,
-                system_prompt=custom_sp.strip(),
-                response_style=persona_rec.response_style,
-                tools=persona_rec.tools,
-                task_hints=persona_rec.task_hints,
-                builtin=persona_rec.builtin,
-                created_at=persona_rec.created_at,
-                updated_at=persona_rec.updated_at,
-            )
-        if attached:
-            enh = enhance_prompt(
-                user_message=prompt,
-                persona_id=persona_id,
-                files_metadata=files_meta,
-                custom_system_prompt=custom_sp if custom_sp.strip() else None,
-            )
-            enhanced_prompt = enh["enhanced_prompt"]
-            enhancement_info = enh["enhancement_log"]
-            enhancement_meta = {
-                "persona_emoji": persona_rec.emoji,
-                "persona_name": persona_rec.name,
-                "system_prompt": persona_rec.system_prompt,
-                "response_style": persona_rec.response_style,
-                "detected_intent": enh["detected_intent"],
-            }
-        else:
-            enhanced_prompt = build_enhanced_prompt(
-                prompt, persona_rec, files_metadata=files_meta,
-            )
-            enhancement_meta = build_enhancement_meta(prompt, persona_rec, files_metadata=files_meta)
-            enhancement_info = (
-                f"페르소나: {persona_rec.emoji} {persona_rec.name} | "
-                f"의도: {enhancement_meta.get('detected_intent', '')}"
-            )
-        st.session_state.last_enhanced_prompt = enhanced_prompt
-        st.session_state.last_enhancement_meta = enhancement_meta
-    else:
-        persona = get_persona(persona_id)
-        system_prompt = custom_sp.strip() if custom_sp.strip() else persona.system_prompt
+    enhanced_prompt, enhancement_info, enhancement_meta, think_steps, persona_rec, system_prompt = (
+        _prepare_enhancement(
+            prompt,
+            attached=attached,
+            persona_id=persona_id,
+            use_enh=use_enh,
+            custom_sp=custom_sp,
+        )
+    )
+    if not use_enh:
         st.session_state.pop("last_enhanced_prompt", None)
 
-    with st.chat_message("assistant"):
-        if enhancement_info:
-            st.caption(f"✨ 보강됨 | {enhancement_info}")
-        if model_switched:
-            st.warning(
-                f"모델 `{requested_model}` 은 RAM이 부족해 **`{model}`** 로 실행합니다. "
-                "사이드바에서 qwen2.5:7b를 직접 선택하는 것을 권장합니다."
-            )
-        if model and not st.session_state.get("ollama_warmed"):
-            with st.spinner("모델 준비 중 (최초 1회)…"):
-                ollama_warmup(model)
-            st.session_state.ollama_warmed = True
-        chart_bytes = None
-        result: dict = {}
-        with st.spinner("AI 처리 중..."):
+    user_trace: dict[str, Any] = {
+        "user_prompt": prompt,
+        "enhanced_prompt": enhanced_prompt if use_enh else "",
+        "thinking_steps": think_steps,
+        "status": "user_submitted",
+    }
+    st.session_state.messages.append({
+        "role": "user",
+        "content": prompt,
+        "trace": user_trace,
+    })
+    _ensure_chat_session()
+
+    assistant_trace: dict[str, Any] = {
+        "user_prompt": prompt,
+        "enhanced_prompt": enhanced_prompt if use_enh else "",
+        "thinking_steps": list(think_steps),
+        "status": "processing",
+        "pipeline_stage": "enhance",
+    }
+
+    start_busy_timer("AI 처리")
+    _append_processing_turn(assistant_trace)
+    try:
+        with st.chat_message("assistant"):
+            if enhancement_info:
+                st.caption(f"✨ 보강됨 | {enhancement_info}")
+            if model_switched:
+                st.warning(
+                    f"모델 `{requested_model}` 은 RAM이 부족해 **`{model}`** 로 실행합니다."
+                )
+
+            render_pipeline_tracker("thinking")
+            render_live_progress(assistant_trace, current_step="Thinking · 코드 생성 준비")
+
+            fast_builtin = attached and _likely_fast_builtin(prompt)
+            if fast_builtin:
+                hint = (
+                    "집행률(%) 표 — LLM·예열 생략"
+                    if _wants_execution_rate_table(prompt)
+                    else "파일별 범위 — LLM·예열 생략"
+                )
+                think_steps.append(empty_trace_step("빠른 경로", hint))
+                assistant_trace["thinking_steps"] = list(think_steps)
+
+            if (
+                model
+                and not st.session_state.get("ollama_warmed")
+                and not fast_builtin
+            ):
+                think_steps.append(empty_trace_step("모델 예열", model))
+                assistant_trace["thinking_steps"] = list(think_steps)
+                render_live_progress(assistant_trace, current_step="모델 GPU 예열 (최초 1회)")
+                with st.status("모델 예열 중…", expanded=True) as warm_st:
+                    warm_st.write("Ollama에 모델을 올리는 중입니다 (30초~2분).")
+                    ollama_warmup(model)
+                    warm_st.update(label="모델 예열 완료", state="complete")
+                st.session_state.ollama_warmed = True
+
             try:
                 if attached:
-                    result = process_excel_prompt(prompt, attached, model)
-                    content = format_result(result)
-                    if result.get("dataframe") is not None:
-                        st.session_state["_last_result_df"] = result["dataframe"]
-                    chart_bytes = result.get("chart_bytes")
-                else:
+                    if not fast_builtin:
+                        model_wait_hint(model)
+                    progress_updates: list[str] = []
+
+                    status_label = "엑셀 코드 생성 중…"
+                    if fast_builtin and _wants_execution_rate_table(prompt):
+                        status_label = "집행률(%) 계산 중…"
+                    elif fast_builtin:
+                        status_label = "파일별 범위 계산 중…"
+                    with st.status(status_label, expanded=True) as pipeline_st:
+                        for msg in progress_updates:
+                            pipeline_st.write(msg)
+                        render_live_progress(
+                            assistant_trace,
+                            current_step="파일 읽기 / 분석",
+                        )
+                        gen = generate_excel_code_only(
+                            prompt,
+                            attached,
+                            model,
+                            thinking_steps=think_steps,
+                            on_progress=lambda m: (
+                                progress_updates.append(m),
+                                pipeline_st.write(m),
+                            ),
+                            use_stream=not fast_builtin,
+                        )
+                        for msg in progress_updates:
+                            pipeline_st.write(msg)
+                        pipeline_st.update(
+                            label="파일 분석 완료" if fast_builtin else "코드 생성 완료",
+                            state="complete",
+                        )
+
+                    if gen.get("error"):
+                        assistant_trace["status"] = "error"
+                        _append_assistant_turn(f"⚠️ {gen['error']}", assistant_trace)
+                        return
+
+                    calls = list(gen.get("ollama_calls") or [])
+                    metrics = _sum_ollama_calls(calls)
+                    assistant_trace.update({
+                        "generated_code": gen.get("code", ""),
+                        "thinking": gen.get("gen_thinking") or metrics.get("thinking", ""),
+                        "thinking_steps": gen.get("thinking_steps", think_steps),
+                        "tokens": metrics["tokens"],
+                        "elapsed_ms": metrics.get("elapsed_ms", 0),
+                        "code_source": gen.get("code_source", "llm"),
+                        "pipeline_stage": "confirm",
+                    })
+                    src = gen.get("code_source", "llm")
+                    if src == "template":
+                        assistant_trace["thinking_steps"].append(
+                            empty_trace_step("코드 출처", "검증된 템플릿 (LLM 생략)"),
+                        )
+                    elif src == "llm":
+                        assistant_trace["thinking_steps"].append(
+                            empty_trace_step("코드 출처", f"Ollama 생성 · {model}"),
+                        )
+
+                    if st.session_state.get("auto_run_excel_code", False):
+                        assistant_trace["thinking_steps"].append(
+                            empty_trace_step("자동 실행", "코드 생성 후 즉시 샌드박스 실행"),
+                        )
+                        render_live_progress(assistant_trace, current_step="코드 실행 중")
+                        with st.status("코드 자동 실행 중…", expanded=True) as auto_st:
+                            auto_st.write("생성된 pandas 코드를 샌드박스에서 실행합니다.")
+                            result = execute_prepared_excel_code(
+                                gen["code"],
+                                gen["frames"],
+                                prompt,
+                                model,
+                                thinking_steps=assistant_trace["thinking_steps"],
+                                ollama_calls=calls,
+                            )
+                            auto_st.update(label="실행 완료", state="complete")
+                        sandbox_ms = (time.perf_counter() - t_turn) * 1000
+                        assistant_trace = merge_trace_metrics({
+                            **assistant_trace,
+                            "generated_code": gen["code"],
+                            "status": "completed",
+                        }, extra_ms=sandbox_ms)
+                        if result.get("ollama_calls"):
+                            m2 = _sum_ollama_calls(
+                                calls + list(result.get("ollama_calls") or []),
+                            )
+                            assistant_trace["tokens"] = m2["tokens"]
+                            assistant_trace["elapsed_ms"] = (
+                                float(assistant_trace.get("elapsed_ms") or 0)
+                                + m2["elapsed_ms"]
+                            )
+                        content = format_result(result)
+                        render_execution_trace(assistant_trace, expanded=True)
+                        st.markdown(content, unsafe_allow_html=True)
+                        if result.get("dataframe") is not None:
+                            st.session_state["_last_result_df"] = result["dataframe"]
+                            render_result_table(result)
+                        if result.get("chart_bytes"):
+                            st.image(
+                                result["chart_bytes"],
+                                caption="📈 분석 차트",
+                                use_container_width=True,
+                            )
+                            st.session_state["_last_chart"] = result["chart_bytes"]
+                        _append_assistant_turn(content, assistant_trace)
+                        return
+
+                    assistant_trace["status"] = "awaiting_exec_confirm"
+                    st.session_state.pending_excel_run = {
+                        "user_prompt": prompt,
+                        "model": model,
+                        "code": gen["code"],
+                        "frames": gen["frames"],
+                        "filenames": attached,
+                        "ollama_calls": calls,
+                        "trace": assistant_trace,
+                    }
+                    render_pipeline_tracker("confirm")
+                    render_live_progress(assistant_trace)
+                    render_execution_trace(assistant_trace, expanded=True)
+                    st.markdown("### 생성된 Python 코드")
+                    st.code(gen["code"], language="python")
+                    st.warning(
+                        "**⑤ 실행 여부 확인** — 코드를 확인한 뒤 아래 **✅ 이대로 실행**을 누르면 "
+                        "⑥ Python 샌드박스 실행 → ⑦ 결과가 표시됩니다."
+                    )
+                    st.session_state["_rerun_for_pending"] = True
+                    return
+
+                model_wait_hint(model)
+                render_live_progress(
+                    assistant_trace,
+                    current_step=f"채팅 응답 생성 ({model})",
+                )
+                with st.status("AI 응답 생성 중…", expanded=True) as chat_st:
+                    chat_st.write(f"모델: `{model}`")
+                    think_steps.append(empty_trace_step("Ollama chat", f"모델: {model}"))
                     if use_enh and enhanced_prompt:
-                        history = st.session_state.messages[:-1]
+                        history = [
+                            m for m in st.session_state.messages[:-1]
+                            if m.get("role") in ("user", "assistant")
+                        ]
                         messages_for_ai = history + [
                             {"role": "user", "content": enhanced_prompt},
                         ]
@@ -1336,22 +2060,35 @@ def process_message(prompt: str) -> None:
                         messages_for_ai = [
                             {"role": "system", "content": system_prompt},
                         ] + st.session_state.messages
-                    content = ollama_chat(model, messages_for_ai)
+                    chat_result = ollama_chat(model, messages_for_ai)
+                    chat_st.update(label="응답 수신 완료", state="complete")
+
+                turn_ms = (time.perf_counter() - t_turn) * 1000
+                assistant_trace.update({
+                    "thinking_steps": think_steps + [
+                        empty_trace_step("응답 수신", chat_result.usage_summary()),
+                    ],
+                    "thinking": chat_result.thinking,
+                    "tokens": tokens_dict_from_result(chat_result),
+                    "elapsed_ms": chat_result.elapsed_ms or turn_ms,
+                    "status": "completed",
+                })
+                render_live_progress(assistant_trace)
+                render_execution_trace(assistant_trace, expanded=True)
+                st.markdown(chat_result.content, unsafe_allow_html=True)
+                _append_assistant_turn(chat_result.content, assistant_trace)
+
             except requests.ConnectionError:
-                content = "⚠️ Ollama 서버에 연결할 수 없습니다. `ollama serve`를 실행하세요."
+                assistant_trace["status"] = "error"
+                _append_assistant_turn(
+                    "⚠️ Ollama 서버에 연결할 수 없습니다. `ollama serve`를 실행하세요.",
+                    assistant_trace,
+                )
             except Exception as exc:
-                content = f"⚠️ 오류: {exc}"
-
-        st.markdown(content, unsafe_allow_html=True)
-        if attached and (
-            result.get("dataframe") is not None or result.get("preview") is not None
-        ):
-            render_result_table(result)
-        if chart_bytes:
-            st.image(chart_bytes, caption="📈 분석 차트", use_container_width=True)
-            st.session_state["_last_chart"] = chart_bytes
-
-    st.session_state.messages.append({"role": "assistant", "content": content})
+                assistant_trace["status"] = "error"
+                _append_assistant_turn(f"⚠️ 오류: {exc}", assistant_trace)
+    finally:
+        stop_busy_timer()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1401,10 +2138,14 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.attached_files = []
         st.session_state.custom_system_prompt = ""
+        st.session_state.chat_session_id = str(uuid.uuid4())
+        st.session_state.active_chat_file = new_live_chat_name(st.session_state.chat_session_id)
+        st.session_state.pending_excel_run = None
         st.session_state.pop("_last_result_df", None)
         st.session_state.pop("_last_chart", None)
         st.session_state.pop("active_flow_step", None)
         st.session_state.pop("flow_step_next", None)
+        st.session_state.pop("_excel_confirm_action", None)
         st.session_state.step_flow = {
             "flow_id": "excel_stepwise",
             "step1": "",
@@ -1423,6 +2164,12 @@ with st.sidebar:
             value=True,
             key="fast_mode",
             help="Ollama 호출 1회로 줄여 응답이 훨씬 빨라집니다.",
+        )
+        st.toggle(
+            "▶ 코드 생성 후 자동 실행 (승인 단계 생략)",
+            value=False,
+            key="auto_run_excel_code",
+            help="기본: ⑤ 실행 확인 → ⑥ Python 실행. 켜면 코드 생성 직후 자동 실행합니다.",
         )
         if st.button("🔥 모델 GPU 예열", use_container_width=True, key="warmup_btn"):
             m = st.session_state.get("selected_model", "")
@@ -1516,15 +2263,38 @@ with st.sidebar:
     # ── 내보내기 ─────────────────────────────────────────────────────────────
     st.markdown("**💾 내보내기**")
     exp_c1, exp_c2 = st.columns(2)
+    def _snapshot_on_download() -> None:
+        msgs = st.session_state.get("messages") or []
+        if not msgs:
+            return
+        _autosave_messages(msgs)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        md_path = save_conversation_md(msgs, f"chat_{ts}")
+        st.session_state["_last_saved_chat"] = str(md_path)
+
     with exp_c1:
-        if st.button("📥 대화 저장", use_container_width=True, help="대화를 .md로 저장"):
-            if st.session_state.messages:
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                md_path = save_conversation_md(st.session_state.messages, f"chat_{ts}")
-                st.session_state["_last_saved_chat"] = str(md_path)
-                st.rerun()
-            else:
-                st.info("대화가 없습니다")
+        chat_msgs = st.session_state.get("messages") or []
+        if chat_msgs:
+            export_title = _chat_summary_title(chat_msgs)
+            export_md = messages_to_markdown(chat_msgs, summary_title=export_title)
+            export_name = f"chat_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            st.download_button(
+                "📥 대화 저장",
+                data=export_md.encode("utf-8"),
+                file_name=export_name,
+                mime="text/markdown",
+                use_container_width=True,
+                help="MD 파일 다운로드 + results/ 스냅샷 저장",
+                on_click=_snapshot_on_download,
+                key="download_chat_md",
+            )
+        else:
+            st.button(
+                "📥 대화 저장",
+                disabled=True,
+                use_container_width=True,
+                help="대화가 없습니다",
+            )
     with exp_c2:
         last_df = st.session_state.get("_last_result_df")
         if last_df is not None:
@@ -1552,6 +2322,8 @@ with st.sidebar:
         st.success(f"저장됨: `{Path(st.session_state['_last_saved_chat']).name}`")
 
     st.divider()
+
+    render_busy_timer_fragment()
 
     saved_chats = list_saved_chats()
     st.markdown(f"**📜 저장된 대화 ({len(saved_chats)}건)**")
@@ -1594,17 +2366,22 @@ SUGGESTIONS = [
 
 messages: list[dict] = st.session_state.get("messages", [])
 pending: str = st.session_state.get("pending_prompt", "")
+pending_excel = st.session_state.get("pending_excel_run")
+
+if st.session_state.get("_excel_confirm_action"):
+    if handle_pending_excel_action():
+        st.rerun()
 
 if pending:
     st.session_state.pending_prompt = ""
     for msg in messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"], unsafe_allow_html=True)
+            render_message_with_trace(msg)
     with st.chat_message("user"):
         st.markdown(pending)
     process_message(pending)
 
-elif not messages:
+elif not messages and not pending_excel:
     st.caption("메시지를 입력하거나, 아래 제안으로 엑셀 분석을 시작하세요. (사이드바에서 파일 ➕ 첨부)")
 
     col_a, col_b = st.columns(2)
@@ -1618,13 +2395,45 @@ elif not messages:
             st.markdown("</div>", unsafe_allow_html=True)
 
 else:
-    # ── 대화 기록 ────────────────────────────────────────────────────────────
-    for msg in messages:
+    for i, msg in enumerate(messages):
+        is_last = i == len(messages) - 1
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"], unsafe_allow_html=True)
+            render_message_with_trace(msg)
+            if (
+                is_last
+                and msg.get("role") == "assistant"
+                and st.session_state.get("_last_result_df") is not None
+            ):
+                render_result_table({
+                    "dataframe": st.session_state["_last_result_df"],
+                    "preview": st.session_state["_last_result_df"].head(TABLE_PREVIEW_ROWS),
+                    "shape": {
+                        "rows": len(st.session_state["_last_result_df"]),
+                        "cols": len(st.session_state["_last_result_df"].columns),
+                    },
+                })
+            if is_last and msg.get("role") == "assistant" and st.session_state.get("_last_chart"):
+                st.image(
+                    st.session_state["_last_chart"],
+                    caption="📈 분석 차트",
+                    use_container_width=True,
+                )
+
+    if pending_excel:
+        with st.chat_message("assistant"):
+            if render_pending_excel_confirm(pending_excel):
+                st.rerun()
 
 # ── 채팅 입력 ────────────────────────────────────────────────────────────────
-if user_input := st.chat_input("메시지를 입력하세요..."):
+_chat_disabled = bool(st.session_state.get("pending_excel_run"))
+if user_input := st.chat_input(
+    "메시지를 입력하세요..." if not _chat_disabled else "코드 실행 확인 후 입력 가능…",
+    disabled=_chat_disabled,
+):
     with st.chat_message("user"):
         st.markdown(user_input)
     process_message(user_input)
+    st.rerun()
+
+if st.session_state.pop("_rerun_for_pending", False):
+    st.rerun()
