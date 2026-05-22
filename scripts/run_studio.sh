@@ -16,6 +16,8 @@ if [[ -d .venv ]]; then
   source .venv/bin/activate
 fi
 
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+
 # 8501은 Windows/excel-platform 과 Cursor 포트 충돌이 잦음 → 8502 고정
 PORT="${PORT:-8502}"
 echo "→ 서버: http://localhost:${PORT}"
