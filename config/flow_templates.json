@@ -1,0 +1,26 @@
+{
+  "flows": [
+    {
+      "id": "excel_stepwise",
+      "name": "엑셀 분석 Step Flow (미리보기)",
+      "description": "STEP 1,2,3 순서로 이어지는 Agent 흐름 — Step 7에서 실행 연동 예정",
+      "steps": [
+        {
+          "id": "step1",
+          "title": "STEP 1 · 파일 구조/범위 확인",
+          "hint": "FILE_META, read_excel_smart"
+        },
+        {
+          "id": "step2",
+          "title": "STEP 2 · 분석/병합 (Persona+Tool)",
+          "hint": "LLM 코드 또는 Tool Calling"
+        },
+        {
+          "id": "step3",
+          "title": "STEP 3 · 승인 후 실행 & Export",
+          "hint": "승인 게이트 + results/"
+        }
+      ]
+    }
+  ]
+}

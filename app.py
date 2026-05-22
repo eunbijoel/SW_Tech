@@ -60,7 +60,7 @@ PREFERRED_MODELS = [
 
 # ─── 페이지 설정 ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI Excel Agent Studio",
+    page_title="Basic SW Technology",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -77,6 +77,8 @@ _DEFAULTS: dict[str, Any] = {
     "custom_system_prompt": "",
     "fast_mode": True,              # True: 코드 1회만 (설명 LLM 생략)
     "ollama_warmed": False,
+    "show_persona_form": False,
+    "target_gpu_device": "GPU0 (기본)",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -309,7 +311,15 @@ def ollama_generate(
 # ══════════════════════════════════════════════════════════════════════════════
 # 페르소나 & 프롬프트 보강 (로컬 — 백엔드 불필요)
 # ══════════════════════════════════════════════════════════════════════════════
-from services.persona_service import get_persona, list_personas, Persona
+from services.persona_service import Persona
+from services.persona_store import get_persona, list_all_personas
+from ui.dashboard import (
+    render_dashboard_top,
+    render_flow_sidebar_section,
+    render_page_title,
+    render_persona_sidebar_section,
+    render_settings_section,
+)
 from services.prompt_enhancer import _asks_merge, _asks_per_file, detect_intent
 from services.prompt_enhancer import enhance as enhance_prompt, detect_intent
 
@@ -1173,78 +1183,11 @@ def process_message(prompt: str) -> None:
 # 사이드바
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("### 📊 AI Excel Agent Studio")
-    st.caption(f"📍 SW_Tech · `{Path(__file__).resolve().name}` · 라이트 테마")
+    st.markdown("### Basic SW Technology")
+    st.caption(f"📍 SW_Tech · `{Path(__file__).resolve().name}` · 포트 8502")
     st.divider()
 
-    # ── 새 대화 ──────────────────────────────────────────────────────────────
-    if st.button("✏️  새 대화", use_container_width=True, type="primary"):
-        st.session_state.messages = []
-        st.session_state.attached_files = []
-        st.session_state.custom_system_prompt = ""
-        st.session_state.pop("_last_result_df", None)
-        st.session_state.pop("_last_chart", None)
-        st.rerun()
-
-    st.divider()
-
-    # ── 페르소나 선택 ────────────────────────────────────────────────────────
-    st.markdown("**🎭 페르소나**")
-    all_personas = list_personas()
-    persona_labels = {p.id: f"{p.emoji} {p.name}" for p in all_personas}
-    persona_ids = list(persona_labels.keys())
-
-    current_persona = st.session_state.get("persona_id", "general")
-    if current_persona not in persona_ids:
-        current_persona = "general"
-
-    st.selectbox(
-        "페르소나",
-        persona_ids,
-        index=persona_ids.index(current_persona),
-        format_func=lambda pid: persona_labels[pid],
-        key="persona_id",
-        label_visibility="collapsed",
-    )
-    selected_persona = get_persona(st.session_state.persona_id)
-    st.caption(f"_{selected_persona.description}_")
-
-    st.divider()
-
-    # ── 프롬프트 보강 토글 ──────────────────────────────────────────────────
-    st.toggle("✨ 프롬프트 보강", value=True, key="use_enhancement")
-    st.toggle(
-        "⚡ 빠른 모드 (코드만, 설명 LLM 생략)",
-        value=True,
-        key="fast_mode",
-        help="Ollama 호출 1회로 줄여 응답이 훨씬 빨라집니다.",
-    )
-    if st.button("🔥 모델 GPU 예열", use_container_width=True, help="qwen2.5:7b 등을 미리 로드"):
-        m = st.session_state.get("selected_model", "")
-        if m and m != "(없음)":
-            ollama_warmup(m)
-            st.session_state.ollama_warmed = True
-            st.success(f"예열 완료: {m}")
-        else:
-            st.info("모델을 먼저 선택하세요")
-
-    # ── 시스템 프롬프트 뷰어 ────────────────────────────────────────────────
-    with st.expander("🔍 현재 시스템 프롬프트", expanded=False):
-        default_sp = selected_persona.system_prompt
-        st.text_area(
-            "시스템 프롬프트 (수정 가능)",
-            value=st.session_state.get("custom_system_prompt", "") or default_sp,
-            height=200,
-            key="custom_system_prompt",
-            label_visibility="collapsed",
-        )
-        if st.button("기본값 복원", key="reset_sp"):
-            st.session_state.custom_system_prompt = ""
-            st.rerun()
-
-    st.divider()
-
-    # ── 모델 선택 ────────────────────────────────────────────────────────────
+    # ── 모델 선택 (목업 상단) ────────────────────────────────────────────────
     st.markdown("**모델 선택**")
     available = ollama_models()
     if not available:
@@ -1269,6 +1212,59 @@ with st.sidebar:
             f"`{sel}` 은 RAM 40GB+ 가 필요할 수 있습니다. "
             "엑셀 분석은 **qwen2.5:7b** 를 선택하세요."
         )
+
+    st.divider()
+
+    # ── 새 대화 ──────────────────────────────────────────────────────────────
+    if st.button("✏️  새 대화", use_container_width=True, type="primary"):
+        st.session_state.messages = []
+        st.session_state.attached_files = []
+        st.session_state.custom_system_prompt = ""
+        st.session_state.pop("_last_result_df", None)
+        st.session_state.pop("_last_chart", None)
+        st.rerun()
+
+    saved_chats = list_saved_chats()
+    st.markdown(f"**📜 저장된 대화 ({len(saved_chats)}건)**")
+    st.caption("STEP 1→2→3 stepwise Flow는 아래 🔗 섹션 (실행은 Step 7)")
+
+    st.divider()
+
+    render_persona_sidebar_section()
+    st.divider()
+
+    render_flow_sidebar_section()
+    st.divider()
+
+    with st.expander("⚙️ 고급 · 엑셀 분석", expanded=False):
+        st.toggle("✨ 프롬프트 보강", value=True, key="use_enhancement")
+        st.toggle(
+            "⚡ 빠른 모드 (코드만, 설명 LLM 생략)",
+            value=True,
+            key="fast_mode",
+            help="Ollama 호출 1회로 줄여 응답이 훨씬 빨라집니다.",
+        )
+        if st.button("🔥 모델 GPU 예열", use_container_width=True, key="warmup_btn"):
+            m = st.session_state.get("selected_model", "")
+            if m and m != "(없음)":
+                ollama_warmup(m)
+                st.session_state.ollama_warmed = True
+                st.success(f"예열 완료: {m}")
+            else:
+                st.info("모델을 먼저 선택하세요")
+        selected_persona = get_persona(st.session_state.persona_id)
+        with st.expander("🔍 시스템 프롬프트 편집", expanded=False):
+            default_sp = selected_persona.system_prompt
+            st.text_area(
+                "시스템 프롬프트",
+                value=st.session_state.get("custom_system_prompt", "") or default_sp,
+                height=160,
+                key="custom_system_prompt",
+                label_visibility="collapsed",
+            )
+            if st.button("기본값 복원", key="reset_sp"):
+                st.session_state.custom_system_prompt = ""
+                st.rerun()
 
     st.divider()
 
@@ -1399,8 +1395,6 @@ with st.sidebar:
     if st.session_state.get("_last_saved_chat"):
         st.success(f"저장됨: `{Path(st.session_state['_last_saved_chat']).name}`")
 
-    saved_chats = list_saved_chats()
-    st.markdown(f"**📜 저장된 대화 ({len(saved_chats)}건)**")
     if not saved_chats:
         st.caption("대화 저장을 누르면 여기에 목록이 쌓입니다.")
     else:
@@ -1445,15 +1439,17 @@ with st.sidebar:
                         st.rerun()
 
     st.divider()
-
-    # ── 서버 상태 ────────────────────────────────────────────────────────────
-    healthy = ollama_health()
-    st.caption(f"{'🟢' if healthy else '🔴'} Ollama {'연결됨' if healthy else '연결 안 됨'}")
+    render_settings_section()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 메인 영역
+# 메인 영역 — 대시보드 + 채팅
 # ══════════════════════════════════════════════════════════════════════════════
+
+render_page_title()
+render_dashboard_top(st.session_state.get("selected_model", ""))
+
+st.markdown("### 채팅")
 
 SUGGESTIONS = [
     ("📊 파일 구조 분석", "첨부된 엑셀 파일의 컬럼 구조와 데이터 유형을 분석해주세요."),
@@ -1480,17 +1476,7 @@ if pending:
     process_message(pending)
 
 elif not messages:
-    # ── 시작 화면 ────────────────────────────────────────────────────────────
-    st.markdown("""
-<div style="text-align:center; margin-top:12vh; margin-bottom:2rem;">
-    <h1 style="font-size:2.5rem; font-weight:700; color:#1d1d1f; margin-bottom:0.4rem;">
-        AI Excel Agent Studio
-    </h1>
-    <p style="color:#6e6e73; font-size:1.05rem;">
-        엑셀 파일을 첨부하고 자연어로 분석·병합·변환하세요
-    </p>
-</div>
-""", unsafe_allow_html=True)
+    st.caption("메시지를 입력하거나, 아래 제안으로 엑셀 분석을 시작하세요. (사이드바에서 파일 ➕ 첨부)")
 
     col_a, col_b = st.columns(2)
     for i, (label, prompt_text) in enumerate(SUGGESTIONS):
@@ -1509,7 +1495,7 @@ else:
             st.markdown(msg["content"], unsafe_allow_html=True)
 
 # ── 채팅 입력 ────────────────────────────────────────────────────────────────
-if user_input := st.chat_input("엑셀 분석 요청을 입력하세요..."):
+if user_input := st.chat_input("메시지를 입력하세요..."):
     with st.chat_message("user"):
         st.markdown(user_input)
     process_message(user_input)
