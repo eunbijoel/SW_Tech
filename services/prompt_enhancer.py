@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from services.persona_service import get_persona
+from services.persona_store import PersonaRecord, get_selected_persona
 
 
 INTENT_KEYWORDS: dict[str, list[str]] = {
@@ -113,47 +113,45 @@ def enhance(
             "enhancement_log": str,
         }
     """
-    persona = get_persona(persona_id)
-    intent = detect_intent(user_message)
-
-    # 시스템 프롬프트 조립
+    persona = get_selected_persona(persona_id)
     if custom_system_prompt and custom_system_prompt.strip():
-        base_prompt = custom_system_prompt.strip()
-        prompt_source = "사용자 지정"
+        persona = PersonaRecord(
+            id=persona.id,
+            name=persona.name,
+            emoji=persona.emoji,
+            description=persona.description,
+            system_prompt=custom_system_prompt.strip(),
+            response_style=persona.response_style,
+            tools=persona.tools,
+            task_hints=persona.task_hints,
+            builtin=persona.builtin,
+            created_at=persona.created_at,
+            updated_at=persona.updated_at,
+        )
+        prompt_source = "사용자 지정 system prompt"
     else:
-        base_prompt = persona.system_prompt
         prompt_source = persona.name
 
-    parts = [base_prompt]
+    from services.persona_prompt import build_enhanced_prompt
 
-    # 파일 컨텍스트 추가
-    file_ctx = build_file_context(files_metadata or [])
-    if file_ctx:
-        parts.append(f"\n[첨부 데이터]\n{file_ctx}")
+    intent = detect_intent(user_message)
+    enhanced_full = build_enhanced_prompt(
+        user_message,
+        persona,
+        files_metadata=files_metadata,
+        include_intent_hint=True,
+    )
 
-    # 의도별 힌트 추가
-    hint = persona.task_hints.get(intent, "")
-    if hint:
-        parts.append(f"\n[작업 지침]\n{hint}")
-
-    enhanced_system_prompt = "\n".join(parts)
-
-    # 사용자 메시지 정제 (원본 유지, 앞뒤 공백만 제거)
-    refined_user_message = user_message.strip()
-
-    # 보강 로그
     intent_label = _INTENT_LABELS.get(intent, intent)
     log_parts = [f"페르소나: {persona.emoji} {prompt_source}"]
     log_parts.append(f"의도: {intent_label}")
-    if file_ctx:
-        log_parts.append(f"파일 {len(files_metadata or [])}개 컨텍스트 추가")
-    if hint:
-        log_parts.append("작업 힌트 적용")
-    enhancement_log = " | ".join(log_parts)
+    if files_metadata:
+        log_parts.append(f"파일 {len(files_metadata)}개 컨텍스트 추가")
 
     return {
-        "enhanced_system_prompt": enhanced_system_prompt,
-        "refined_user_message": refined_user_message,
+        "enhanced_system_prompt": enhanced_full,
+        "enhanced_prompt": enhanced_full,
+        "refined_user_message": user_message.strip(),
         "detected_intent": intent,
-        "enhancement_log": enhancement_log,
+        "enhancement_log": " | ".join(log_parts),
     }

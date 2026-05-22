@@ -1,0 +1,15 @@
+{
+  "flow_id": "excel_stepwise",
+  "links": [
+    {
+      "chat": "chat_20260519_173549.md",
+      "step_id": "step1",
+      "label": "STEP 1 · 출처 컬럼 + 파일별 집행률"
+    },
+    {
+      "chat": "chat_20260520_163241.md",
+      "step_id": "step2",
+      "label": "STEP 2 · 3파일 통합 + 평균 + 차트"
+    }
+  ]
+}

@@ -6,8 +6,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -46,8 +48,13 @@ class SystemSnapshot:
     disk_used_gb: float = 0.0
     disk_total_gb: float = 0.0
     disk_path: str = "/"
+    disk_mount_label: str = "/"
+    project_dir_gb: float = 0.0
+    project_dir_path: str = ""
     ollama_connected: bool = False
     ollama_models: list[str] = field(default_factory=list)
+    hostname: str = ""
+    cpu_usage_pct: float = 0.0
     cuda_visible: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -119,6 +126,20 @@ def collect_disk_gb(path: str = "/") -> tuple[float, float, str]:
         return 0.0, 0.0, path
 
 
+def collect_dir_size_gb(path: str | Path) -> float:
+    """디렉터리 실제 용량 — du 우선."""
+    root = Path(path)
+    if not root.exists():
+        return 0.0
+    out = _run(["du", "-sb", str(root)], timeout=15)
+    if out:
+        try:
+            return int(out.split()[0]) / (1024**3)
+        except (ValueError, IndexError):
+            pass
+    return 0.0
+
+
 def collect_ollama_status() -> tuple[bool, list[str], str | None]:
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
@@ -131,8 +152,12 @@ def collect_ollama_status() -> tuple[bool, list[str], str | None]:
         return False, [], str(exc)
 
 
-def collect_system_snapshot(disk_path: str | None = None) -> SystemSnapshot:
-    disk_path = disk_path or os.getcwd()
+def collect_system_snapshot(
+    disk_path: str | None = None,
+    project_dir: str | Path | None = None,
+) -> SystemSnapshot:
+    """디스크는 기본 루트 파티션(/) — 프로젝트 폴더 용량은 별도 표시."""
+    disk_mount = disk_path or "/"
     snap = SystemSnapshot()
     snap.gpus = collect_gpu_devices()
     snap.ram_used_gb, snap.ram_total_gb = collect_memory_gb()
@@ -141,7 +166,17 @@ def collect_system_snapshot(disk_path: str | None = None) -> SystemSnapshot:
         snap.load_avg_1m = os.getloadavg()[0]
     except OSError:
         snap.load_avg_1m = 0.0
-    snap.disk_used_gb, snap.disk_total_gb, snap.disk_path = collect_disk_gb(disk_path)
+    if snap.cpu_count > 0:
+        snap.cpu_usage_pct = min(100.0, (snap.load_avg_1m / snap.cpu_count) * 100.0)
+    try:
+        snap.hostname = socket.gethostname()
+    except OSError:
+        snap.hostname = ""
+    snap.disk_used_gb, snap.disk_total_gb, snap.disk_path = collect_disk_gb(disk_mount)
+    snap.disk_mount_label = disk_mount
+    proj = Path(project_dir or os.getcwd()).resolve()
+    snap.project_dir_path = str(proj)
+    snap.project_dir_gb = collect_dir_size_gb(proj)
     connected, models, err = collect_ollama_status()
     snap.ollama_connected = connected
     snap.ollama_models = models

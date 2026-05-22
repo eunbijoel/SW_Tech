@@ -1,5 +1,5 @@
 """
-AI Excel Agent Studio — Streamlit 기반 AI 엑셀 분석 도구
+Basic SW Technology — Streamlit 기반 AI 엑셀 분석 도구
 Ollama 로컬 모델을 활용한 자연어 엑셀 처리·분석·병합·내보내기
 """
 from __future__ import annotations
@@ -202,9 +202,121 @@ def is_heavy_ollama_model(model: str) -> bool:
     return any(h in n for h in _HEAVY_MODEL_HINTS)
 
 
-def pick_safe_ollama_model(model: str, available: list[str]) -> str:
-    """대형 모델이면 qwen2.5:7b 등 경량 모델로 대체."""
+def _ollama_show_model(name: str) -> dict[str, Any] | None:
+    """Ollama /api/show — VRAM 추정용."""
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/show",
+            json={"name": name},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def _parse_param_billions(param_size: str) -> float | None:
+    m = re.search(r"([\d.]+)\s*[Bb]", param_size)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"([\d.]+)\s*[Mm]", param_size)
+    if m:
+        return float(m.group(1)) / 1000
+    return None
+
+
+def _parse_quant_bits(quant_level: str) -> float:
+    if not quant_level:
+        return 16.0
+    q = quant_level.upper()
+    if "Q2" in q:
+        return 2.5
+    if "Q3" in q:
+        return 3.5
+    if "Q4" in q:
+        return 4.5
+    if "Q5" in q:
+        return 5.5
+    if "Q6" in q:
+        return 6.5
+    if "Q8" in q:
+        return 8.0
+    if "F16" in q or "FP16" in q:
+        return 16.0
+    if "F32" in q or "FP32" in q:
+        return 32.0
+    return 4.5
+
+
+def _estimate_model_vram_gb(model_name: str) -> float | None:
+    data = _ollama_show_model(model_name)
+    if not data:
+        return None
+    details = data.get("details", {})
+    param_size = details.get("parameter_size", "")
+    params_b = _parse_param_billions(param_size)
+    if params_b is None:
+        return None
+    bits = _parse_quant_bits(details.get("quantization_level", ""))
+    return round(params_b * bits / 8 * 1.2, 1)
+
+
+def model_fits_gpu(model: str, snap: Any) -> bool | None:
+    """True=GPU VRAM 충분, False=부족, None=판단 불가."""
+    if not model or not getattr(snap, "gpus", None):
+        return None
+    estimated = _estimate_model_vram_gb(model)
+    if estimated is None:
+        return None
+    available_gb = snap.gpus[0].memory_total_mb / 1024
+    return estimated <= available_gb
+
+
+def sidebar_model_notice(
+    model: str,
+    snap: Any,
+    *,
+    has_excel_files: bool,
+) -> str | None:
+    """대형 모델 선택 시 사이드바 안내 — None이면 표시 안 함."""
+    if not model or model == "(없음)":
+        return None
+    if not is_heavy_ollama_model(model):
+        return None
+
+    fits = model_fits_gpu(model, snap)
+    if fits is True:
+        if has_excel_files:
+            return (
+                f"`{model}` — GPU VRAM 충분합니다. "
+                "엑셀 코드 생성은 **qwen2.5:7b** 가 더 빠를 수 있습니다."
+            )
+        return None
+
+    if fits is False and snap.gpus:
+        g = snap.gpus[0]
+        return (
+            f"`{model}` 은 이 GPU({g.memory_label})에 맞지 않을 수 있습니다. "
+            "qwen2.5:7b 또는 더 작은 모델을 권장합니다."
+        )
+
+    return (
+        f"`{model}` 은 용량이 큰 모델입니다. "
+        "Ollama 실행 시 RAM/VRAM을 확인하세요."
+    )
+
+
+def pick_safe_ollama_model(
+    model: str,
+    available: list[str],
+    snap: Any | None = None,
+) -> str:
+    """대형 모델 — GPU VRAM이 충분하면 사용자 선택 유지, 아니면 경량 모델로 대체."""
     if model and not is_heavy_ollama_model(model):
+        return model
+    if snap is not None and model_fits_gpu(model, snap) is True:
         return model
     for candidate in ("qwen2.5:7b", "llama3", "gemma2", "phi3"):
         for m in available:
@@ -311,17 +423,21 @@ def ollama_generate(
 # ══════════════════════════════════════════════════════════════════════════════
 # 페르소나 & 프롬프트 보강 (로컬 — 백엔드 불필요)
 # ══════════════════════════════════════════════════════════════════════════════
-from services.persona_service import Persona
-from services.persona_store import get_persona, list_all_personas
+from services.persona_prompt import build_enhanced_prompt, build_enhancement_meta
+from services.persona_store import PersonaRecord, ensure_personas_file, get_persona, get_selected_persona
 from ui.dashboard import (
+    ROOT as PROJECT_ROOT,
+    _cached_snapshot,
     render_dashboard_top,
-    render_flow_sidebar_section,
     render_page_title,
-    render_persona_sidebar_section,
     render_settings_section,
 )
-from services.prompt_enhancer import _asks_merge, _asks_per_file, detect_intent
-from services.prompt_enhancer import enhance as enhance_prompt, detect_intent
+from ui.persona_ui import render_enhanced_prompt_preview, render_persona_sidebar
+from ui.saved_chats import render_saved_chats_section
+from ui.step_flow import init_step_flow_state, render_step_flow_sidebar
+from services.prompt_enhancer import _asks_merge, _asks_per_file, detect_intent, enhance as enhance_prompt
+
+ensure_personas_file()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -981,6 +1097,18 @@ def save_conversation_md(messages: list[dict], name: str) -> Path:
     return path.resolve()
 
 
+def _chat_preview_line(path: Path, max_len: int = 72) -> str:
+    try:
+        for m in load_conversation_md(path):
+            if m.get("role") == "user":
+                text = m.get("content", "").strip().replace("\n", " ")
+                if text:
+                    return text[:max_len] + ("…" if len(text) > max_len else "")
+    except Exception:
+        pass
+    return ""
+
+
 def list_saved_chats(limit: int = 30) -> list[dict]:
     """results/ 아래 chat_*.md 목록 (최신순)."""
     items: list[dict] = []
@@ -991,6 +1119,7 @@ def list_saved_chats(limit: int = 30) -> list[dict]:
             "path": p.resolve(),
             "mtime": datetime.datetime.fromtimestamp(stat.st_mtime),
             "size": stat.st_size,
+            "preview": _chat_preview_line(p),
         })
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return items[:limit]
@@ -1110,7 +1239,8 @@ def process_message(prompt: str) -> None:
     st.session_state.messages.append({"role": "user", "content": prompt})
     available_models = ollama_models()
     requested_model = st.session_state.get("selected_model", "")
-    model = pick_safe_ollama_model(requested_model, available_models)
+    hw_snap = _cached_snapshot("/", str(PROJECT_ROOT))
+    model = pick_safe_ollama_model(requested_model, available_models, snap=hw_snap)
     model_switched = requested_model and model != requested_model
     if model_switched:
         st.session_state.selected_model = model
@@ -1121,19 +1251,58 @@ def process_message(prompt: str) -> None:
 
     # 프롬프트 보강
     enhancement_info = ""
+    enhanced_prompt = ""
+    enhancement_meta: dict = {}
+    persona_rec = get_selected_persona(persona_id)
+    st.session_state.last_user_prompt = prompt
+
     if use_enh:
         files_meta = _build_files_metadata(attached) if attached else []
-        enh = enhance_prompt(
-            user_message=prompt,
-            persona_id=persona_id,
-            files_metadata=files_meta,
-            custom_system_prompt=custom_sp if custom_sp.strip() else None,
-        )
-        system_prompt = enh["enhanced_system_prompt"]
-        enhancement_info = enh["enhancement_log"]
+        if custom_sp.strip():
+            persona_rec = PersonaRecord(
+                id=persona_rec.id,
+                name=persona_rec.name,
+                emoji=persona_rec.emoji,
+                description=persona_rec.description,
+                system_prompt=custom_sp.strip(),
+                response_style=persona_rec.response_style,
+                tools=persona_rec.tools,
+                task_hints=persona_rec.task_hints,
+                builtin=persona_rec.builtin,
+                created_at=persona_rec.created_at,
+                updated_at=persona_rec.updated_at,
+            )
+        if attached:
+            enh = enhance_prompt(
+                user_message=prompt,
+                persona_id=persona_id,
+                files_metadata=files_meta,
+                custom_system_prompt=custom_sp if custom_sp.strip() else None,
+            )
+            enhanced_prompt = enh["enhanced_prompt"]
+            enhancement_info = enh["enhancement_log"]
+            enhancement_meta = {
+                "persona_emoji": persona_rec.emoji,
+                "persona_name": persona_rec.name,
+                "system_prompt": persona_rec.system_prompt,
+                "response_style": persona_rec.response_style,
+                "detected_intent": enh["detected_intent"],
+            }
+        else:
+            enhanced_prompt = build_enhanced_prompt(
+                prompt, persona_rec, files_metadata=files_meta,
+            )
+            enhancement_meta = build_enhancement_meta(prompt, persona_rec, files_metadata=files_meta)
+            enhancement_info = (
+                f"페르소나: {persona_rec.emoji} {persona_rec.name} | "
+                f"의도: {enhancement_meta.get('detected_intent', '')}"
+            )
+        st.session_state.last_enhanced_prompt = enhanced_prompt
+        st.session_state.last_enhancement_meta = enhancement_meta
     else:
         persona = get_persona(persona_id)
         system_prompt = custom_sp.strip() if custom_sp.strip() else persona.system_prompt
+        st.session_state.pop("last_enhanced_prompt", None)
 
     with st.chat_message("assistant"):
         if enhancement_info:
@@ -1158,9 +1327,15 @@ def process_message(prompt: str) -> None:
                         st.session_state["_last_result_df"] = result["dataframe"]
                     chart_bytes = result.get("chart_bytes")
                 else:
-                    messages_for_ai = [
-                        {"role": "system", "content": system_prompt}
-                    ] + st.session_state.messages
+                    if use_enh and enhanced_prompt:
+                        history = st.session_state.messages[:-1]
+                        messages_for_ai = history + [
+                            {"role": "user", "content": enhanced_prompt},
+                        ]
+                    else:
+                        messages_for_ai = [
+                            {"role": "system", "content": system_prompt},
+                        ] + st.session_state.messages
                     content = ollama_chat(model, messages_for_ai)
             except requests.ConnectionError:
                 content = "⚠️ Ollama 서버에 연결할 수 없습니다. `ollama serve`를 실행하세요."
@@ -1207,11 +1382,17 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     sel = st.session_state.get("selected_model", current)
-    if is_heavy_ollama_model(sel):
-        st.warning(
-            f"`{sel}` 은 RAM 40GB+ 가 필요할 수 있습니다. "
-            "엑셀 분석은 **qwen2.5:7b** 를 선택하세요."
-        )
+    _hw = _cached_snapshot("/", str(PROJECT_ROOT))
+    _notice = sidebar_model_notice(
+        sel,
+        _hw,
+        has_excel_files=bool(st.session_state.get("attached_files")),
+    )
+    if _notice:
+        if "GPU VRAM 충분" in _notice:
+            st.info(_notice)
+        else:
+            st.warning(_notice)
 
     st.divider()
 
@@ -1222,22 +1403,21 @@ with st.sidebar:
         st.session_state.custom_system_prompt = ""
         st.session_state.pop("_last_result_df", None)
         st.session_state.pop("_last_chart", None)
+        st.session_state.pop("active_flow_step", None)
+        st.session_state.pop("flow_step_next", None)
+        st.session_state.step_flow = {
+            "flow_id": "excel_stepwise",
+            "step1": "",
+            "step2": "",
+            "step3": "",
+        }
         st.rerun()
 
-    saved_chats = list_saved_chats()
-    st.markdown(f"**📜 저장된 대화 ({len(saved_chats)}건)**")
-    st.caption("STEP 1→2→3 stepwise Flow는 아래 🔗 섹션 (실행은 Step 7)")
-
-    st.divider()
-
-    render_persona_sidebar_section()
-    st.divider()
-
-    render_flow_sidebar_section()
-    st.divider()
+    render_persona_sidebar()
 
     with st.expander("⚙️ 고급 · 엑셀 분석", expanded=False):
-        st.toggle("✨ 프롬프트 보강", value=True, key="use_enhancement")
+        st.toggle("✨ 프롬프트 보강 (Persona 결합)", value=True, key="use_enhancement")
+        st.caption("끄면 Persona 없이 기존 system prompt + 일반 메시지만 전송합니다.")
         st.toggle(
             "⚡ 빠른 모드 (코드만, 설명 LLM 생략)",
             value=True,
@@ -1252,26 +1432,11 @@ with st.sidebar:
                 st.success(f"예열 완료: {m}")
             else:
                 st.info("모델을 먼저 선택하세요")
-        selected_persona = get_persona(st.session_state.persona_id)
-        with st.expander("🔍 시스템 프롬프트 편집", expanded=False):
-            default_sp = selected_persona.system_prompt
-            st.text_area(
-                "시스템 프롬프트",
-                value=st.session_state.get("custom_system_prompt", "") or default_sp,
-                height=160,
-                key="custom_system_prompt",
-                label_visibility="collapsed",
-            )
-            if st.button("기본값 복원", key="reset_sp"):
-                st.session_state.custom_system_prompt = ""
-                st.rerun()
 
-    st.divider()
-
-    # ── 파일 업로드 ──────────────────────────────────────────────────────────
-    with st.expander("📁 파일 업로드", expanded=False):
+    # ── Excel · 파일 (업로드 / 목록 / 첨부 / 미리보기) ───────────────────────
+    with st.expander("📁 Excel · 파일", expanded=False):
         uploads = st.file_uploader(
-            "Excel / CSV 파일",
+            "Excel / CSV 업로드",
             type=["xlsx", "xls", "csv"],
             accept_multiple_files=True,
             label_visibility="collapsed",
@@ -1283,77 +1448,68 @@ with st.sidebar:
             st.success(f"{len(uploads)}개 파일 저장됨")
             st.rerun()
 
-    st.divider()
+        st.markdown("**📂 Excel 파일 목록**")
+        excel_files = list_excel_files()
 
-    # ── 파일 목록 & 첨부 ────────────────────────────────────────────────────
-    st.markdown("**📂 Excel 파일 목록**")
-    excel_files = list_excel_files()
+        if excel_files:
+            for ef in excel_files:
+                fname = ef["name"]
+                is_attached = fname in st.session_state.attached_files
+                size_str = file_size_fmt(ef["size"])
+                date_str = ef["modified"].strftime("%m/%d %H:%M")
 
-    if excel_files:
-        for ef in excel_files:
-            fname = ef["name"]
-            is_attached = fname in st.session_state.attached_files
-            size_str = file_size_fmt(ef["size"])
-            date_str = ef["modified"].strftime("%m/%d %H:%M")
-
-            c1, c2, c3 = st.columns([5, 1, 1])
-            with c1:
-                icon = "📌" if is_attached else "📄"
-                st.caption(f"{icon} {fname}  \n  {size_str} · {date_str}")
-            with c2:
-                if is_attached:
-                    if st.button("➖", key=f"detach_{fname}", help="첨부 해제"):
-                        st.session_state.attached_files.remove(fname)
+                c1, c2, c3 = st.columns([5, 1, 1])
+                with c1:
+                    icon = "📌" if is_attached else "📄"
+                    st.caption(f"{icon} {fname}  \n  {size_str} · {date_str}")
+                with c2:
+                    if is_attached:
+                        if st.button("➖", key=f"detach_{fname}", help="첨부 해제"):
+                            st.session_state.attached_files.remove(fname)
+                            st.rerun()
+                    else:
+                        if st.button("➕", key=f"attach_{fname}", help="첨부"):
+                            st.session_state.attached_files.append(fname)
+                            st.rerun()
+                with c3:
+                    if st.button("🗑", key=f"del_{fname}", help="삭제"):
+                        (EXCEL_DIR / fname).unlink(missing_ok=True)
+                        if fname in st.session_state.attached_files:
+                            st.session_state.attached_files.remove(fname)
                         st.rerun()
-                else:
-                    if st.button("➕", key=f"attach_{fname}", help="첨부"):
-                        st.session_state.attached_files.append(fname)
-                        st.rerun()
-            with c3:
-                if st.button("🗑", key=f"del_{fname}", help="삭제"):
-                    (EXCEL_DIR / fname).unlink(missing_ok=True)
-                    if fname in st.session_state.attached_files:
-                        st.session_state.attached_files.remove(fname)
-                    st.rerun()
-    else:
-        st.caption("파일 없음 — 위에서 업로드하세요")
+        else:
+            st.caption("파일 없음 — 위에서 업로드하세요")
 
-    st.divider()
+        attached = st.session_state.attached_files
+        st.markdown(f"**📌 첨부 파일 ({len(attached)}개)**")
+        if attached:
+            for fname in attached:
+                st.caption(f"• {fname}")
+        else:
+            st.caption("파일을 ➕로 첨부하세요")
 
-    # ── 첨부된 파일 ──────────────────────────────────────────────────────────
-    attached = st.session_state.attached_files
-    st.markdown(f"**📌 첨부 파일 ({len(attached)}개)**")
-    if attached:
-        for fname in attached:
-            st.caption(f"• {fname}")
-    else:
-        st.caption("파일을 ➕로 첨부하세요")
-
-    st.divider()
-
-    # ── 파일 미리보기 ────────────────────────────────────────────────────────
-    st.markdown("**👁 파일 미리보기**")
-    preview_options = [ef["name"] for ef in excel_files] if excel_files else []
-    if preview_options:
-        preview_file = st.selectbox(
-            "미리보기 파일",
-            preview_options,
-            label_visibility="collapsed",
-        )
-        if preview_file:
-            try:
-                preview_df = read_excel_smart(str(EXCEL_DIR / preview_file))
-                st.caption(f"{preview_df.shape[0]}행 × {preview_df.shape[1]}열")
-                st.dataframe(
-                    preview_df.head(8),
-                    use_container_width=True,
-                    height=160,
-                    hide_index=True,
-                )
-            except Exception as e:
-                st.error(f"미리보기 실패: {e}")
-    else:
-        st.caption("파일 없음")
+        st.markdown("**👁 파일 미리보기**")
+        preview_options = [ef["name"] for ef in excel_files] if excel_files else []
+        if preview_options:
+            preview_file = st.selectbox(
+                "미리보기 파일",
+                preview_options,
+                label_visibility="collapsed",
+            )
+            if preview_file:
+                try:
+                    preview_df = read_excel_smart(str(EXCEL_DIR / preview_file))
+                    st.caption(f"{preview_df.shape[0]}행 × {preview_df.shape[1]}열")
+                    st.dataframe(
+                        preview_df.head(8),
+                        use_container_width=True,
+                        height=160,
+                        hide_index=True,
+                    )
+                except Exception as e:
+                    st.error(f"미리보기 실패: {e}")
+        else:
+            st.caption("미리볼 파일 없음")
 
     st.divider()
 
@@ -1395,48 +1551,21 @@ with st.sidebar:
     if st.session_state.get("_last_saved_chat"):
         st.success(f"저장됨: `{Path(st.session_state['_last_saved_chat']).name}`")
 
-    if not saved_chats:
-        st.caption("대화 저장을 누르면 여기에 목록이 쌓입니다.")
-    else:
-        for item in saved_chats:
-            fname = item["name"]
-            mtime_str = item["mtime"].strftime("%m/%d %H:%M")
-            preview_user = ""
-            try:
-                msgs = load_conversation_md(Path(item["path"]))
-                for m in msgs:
-                    if m["role"] == "user":
-                        preview_user = m["content"][:40].replace("\n", " ")
-                        break
-            except Exception:
-                pass
+    st.divider()
 
-            label = preview_user or fname
-            with st.expander(f"{mtime_str} · {label}", expanded=False):
-                st.caption(fname)
-                c_load, c_dl, c_del = st.columns([2, 1, 1])
-                with c_load:
-                    if st.button("불러오기", key=f"load_chat_{fname}", use_container_width=True):
-                        st.session_state.messages = load_conversation_md(Path(item["path"]))
-                        st.session_state.pop("_last_result_df", None)
-                        st.session_state.pop("_last_chart", None)
-                        st.rerun()
-                with c_dl:
-                    try:
-                        st.download_button(
-                            "⬇",
-                            data=Path(item["path"]).read_bytes(),
-                            file_name=fname,
-                            mime="text/markdown",
-                            key=f"dl_chat_{fname}",
-                            use_container_width=True,
-                        )
-                    except Exception:
-                        pass
-                with c_del:
-                    if st.button("🗑", key=f"del_chat_{fname}", use_container_width=True):
-                        Path(item["path"]).unlink(missing_ok=True)
-                        st.rerun()
+    saved_chats = list_saved_chats()
+    st.markdown(f"**📜 저장된 대화 ({len(saved_chats)}건)**")
+    render_saved_chats_section(saved_chats, load_fn=load_conversation_md)
+
+    st.divider()
+
+    render_step_flow_sidebar(saved_chats)
+
+    if st.session_state.get("last_enhanced_prompt"):
+        render_enhanced_prompt_preview(
+            st.session_state.last_enhanced_prompt,
+            st.session_state.get("last_enhancement_meta"),
+        )
 
     st.divider()
     render_settings_section()
