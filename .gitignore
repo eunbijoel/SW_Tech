@@ -30,6 +30,7 @@ excel/
 storage/uploads/
 storage/results/
 chat_history/
+results/
 
 # SheetPilot 업로드/결과 (사용자 파일, 커밋 제외)
 uploads/*

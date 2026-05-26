@@ -1,4 +1,4 @@
-"""Persona + 사용자 Prompt 결합 — enhanced prompt 생성."""
+"""Persona + 사용자 Prompt — 구조화 파이프라인 래퍼."""
 from __future__ import annotations
 
 from typing import Any
@@ -13,41 +13,23 @@ def build_enhanced_prompt(
     persona_id: str | None = None,
     files_metadata: list[dict] | None = None,
     include_intent_hint: bool = True,
+    frames: dict | None = None,
+    filenames: list[str] | None = None,
 ) -> str:
-    """Persona instruction과 사용자 Prompt를 하나의 블록으로 결합."""
-    from services.prompt_enhancer import build_file_context, detect_intent
+    """구조화 Persona 프롬프트 미리보기 텍스트 (레거시 API 호환)."""
+    from src.persona_pipeline import prepare_persona_execution
 
     p = persona or get_selected_persona(persona_id or "general")
-    user_prompt = user_prompt.strip()
-
-    blocks = [
-        "[Persona]",
-        f"Name: {p.name}",
-        f"Role: {p.description}",
-        "",
-        "[System Instruction]",
-        p.system_prompt.strip(),
-        "",
-        "[Response Style]",
-        p.response_style.strip() or "(기본 스타일)",
-    ]
-
-    if p.tools:
-        blocks.extend(["", "[Tools]", ", ".join(p.tools)])
-
-    if files_metadata:
-        file_ctx = build_file_context(files_metadata)
-        if file_ctx:
-            blocks.extend(["", "[Attached Data]", file_ctx])
-
-    if include_intent_hint and p.task_hints:
-        intent = detect_intent(user_prompt)
-        hint = p.task_hints.get(intent, "")
-        if hint:
-            blocks.extend(["", f"[Task Hint · {intent}]", hint])
-
-    blocks.extend(["", "[User Request]", user_prompt])
-    return "\n".join(blocks)
+    fn = filenames or [m.get("name", "") for m in (files_metadata or []) if m.get("name")]
+    plan = prepare_persona_execution(
+        user_prompt.strip(),
+        p.id,
+        filenames=fn,
+        frames=frames or {},
+        files_metadata=files_metadata,
+        use_enhancement=True,
+    )
+    return plan.preview_text
 
 
 def build_enhancement_meta(

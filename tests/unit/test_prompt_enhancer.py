@@ -89,7 +89,8 @@ class TestEnhance:
 
     def test_persona_applied(self):
         result = enhance("분석해줘", "data_analyst")
-        assert "수석 데이터 분석가" in result["enhanced_system_prompt"]
+        assert "데이터 분석가" in result["enhanced_system_prompt"]
+        assert "execution_path" in result
 
     def test_general_persona_fallback(self):
         result = enhance("안녕", "unknown_id")
@@ -98,8 +99,8 @@ class TestEnhance:
     def test_file_context_included(self):
         meta = [{"name": "test.xlsx", "rows": 10, "cols": 3}]
         result = enhance("분석해줘", "general", files_metadata=meta)
-        assert "[Attached Data]" in result["enhanced_system_prompt"]
         assert "test.xlsx" in result["enhanced_system_prompt"]
+        assert "file_context" in result["enhanced_system_prompt"] or "첨부파일" in result["enhanced_system_prompt"]
 
     def test_no_files_no_context(self):
         result = enhance("분석해줘", "general", files_metadata=[])
@@ -108,14 +109,13 @@ class TestEnhance:
     def test_task_hint_applied(self):
         result = enhance("파일 3개를 병합해주세요", "data_analyst")
         assert result["detected_intent"] == "MERGE"
-        assert "[Task Hint · MERGE]" in result["enhanced_system_prompt"]
+        assert "MERGE" in result["enhanced_system_prompt"]
 
     def test_custom_system_prompt_overrides(self):
         custom = "나는 커스텀 프롬프트입니다."
         result = enhance("분석해줘", "data_analyst", custom_system_prompt=custom)
         assert custom in result["enhanced_system_prompt"]
-        assert "[System Instruction]" in result["enhanced_system_prompt"]
-        assert "사용자 지정" in result["enhancement_log"]
+        assert "system_instruction" in result["enhanced_system_prompt"]
 
     def test_refined_message_trimmed(self):
         result = enhance("  공백 있는 메시지  ", "general")

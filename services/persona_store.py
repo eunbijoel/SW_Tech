@@ -48,6 +48,11 @@ class PersonaRecord:
     builtin: bool = False
     created_at: str = ""
     updated_at: str = ""
+    # Persona 맞춤 분석 실행 (src/persona_manager 프로필과 동기)
+    analysis_focus: list[str] = field(default_factory=list)
+    response_template: list[str] = field(default_factory=list)
+    style_rules: dict[str, str] = field(default_factory=dict)
+    is_default: bool = False
 
     def to_persona(self) -> Persona:
         return Persona(
@@ -68,6 +73,7 @@ class PersonaRecord:
         tools = data.get("tools") or []
         if isinstance(tools, str):
             tools = [t.strip() for t in tools.split(",") if t.strip()]
+        builtin = bool(data.get("builtin", data.get("is_default", False)))
         return cls(
             id=data["id"],
             name=data.get("name", data["id"]),
@@ -78,9 +84,13 @@ class PersonaRecord:
             tools=list(tools),
             emoji=data.get("emoji", "🎯"),
             task_hints=dict(data.get("task_hints") or {}),
-            builtin=bool(data.get("builtin", False)),
+            builtin=builtin,
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
+            analysis_focus=list(data.get("analysis_focus") or []),
+            response_template=list(data.get("response_template") or []),
+            style_rules=dict(data.get("style_rules") or {}),
+            is_default=bool(data.get("is_default", builtin)),
         )
 
 

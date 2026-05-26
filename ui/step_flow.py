@@ -1,4 +1,4 @@
-"""Step Flow / Skill — 저장된 대화를 Step 단위로 묶는 사이드바 UI."""
+"""Step Flow / Skill — 저장된 대화를 Step 단위로 묶어 순차 실행하는 사이드바 UI."""
 from __future__ import annotations
 
 import html
@@ -9,6 +9,12 @@ from typing import Any
 import streamlit as st
 
 from services.chat_catalog import format_step_select_label
+from services.step_flow_engine import (
+    FlowExecutionResult,
+    StepContext,
+    build_data_flow_html,
+    prepare_flow_execution,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 FLOW_TEMPLATES_PATH = ROOT / "config" / "flow_templates.json"
@@ -105,6 +111,16 @@ def _step_flow_css() -> None:
     border: 2px solid #0071e3;
     box-shadow: 0 0 0 1px rgba(0,113,227,0.15);
 }
+[data-testid="stSidebar"] .sf-node.running {
+    color: #b35900;
+    background: #fff8e6;
+    border: 2px solid #ff9500;
+    animation: sf-pulse 1.5s infinite;
+}
+@keyframes sf-pulse {
+    0%, 100% { box-shadow: 0 0 0 1px rgba(255,149,0,0.15); }
+    50% { box-shadow: 0 0 0 4px rgba(255,149,0,0.25); }
+}
 [data-testid="stSidebar"] .sf-arrow {
     flex: 0 0 auto;
     align-self: center;
@@ -149,21 +165,55 @@ def _step_flow_css() -> None:
     color: #86868b;
     background: #f5f5f7;
 }
+[data-testid="stSidebar"] .sf-dataflow {
+    margin: 0.5rem 0;
+    padding: 0.5rem;
+    background: #fafafa;
+    border-radius: 10px;
+    border: 1px solid #e5e5ea;
+}
+[data-testid="stSidebar"] .sf-df-step {
+    padding: 0.4rem 0.5rem;
+    background: #fff;
+    border-radius: 8px;
+    border: 1px solid #e5e5ea;
+    margin: 0.2rem 0;
+}
+[data-testid="stSidebar"] .sf-df-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #1d1d1f;
+}
+[data-testid="stSidebar"] .sf-df-detail {
+    font-size: 0.68rem;
+    color: #6e6e73;
+    margin: 0.1rem 0;
+}
+[data-testid="stSidebar"] .sf-df-arrow {
+    text-align: center;
+    font-size: 0.9rem;
+    color: #0071e3;
+    padding: 0.1rem 0;
+}
 </style>
 """,
         unsafe_allow_html=True,
     )
 
 
-def _render_flowchart_nodes(step_flow: dict[str, str]) -> None:
+def _render_flowchart_nodes(
+    step_flow: dict[str, str],
+    running_step: str = "",
+) -> None:
+    """Step 노드 시각화. running_step이 설정되면 해당 노드에 running 효과."""
     nodes: list[str] = []
     for step_key, label, _desc in STEP_DEFS:
         val = step_flow.get(step_key, "")
         cls = "sf-node"
-        if val:
+        if step_key == running_step:
+            cls += " running"
+        elif val:
             cls += " done"
-        if step_key == "step2" and val:
-            cls += " active"
         nodes.append(f'<div class="{cls}">{_esc(label)}</div>')
 
     arrows = '<span class="sf-arrow">→</span>'
@@ -222,6 +272,42 @@ def render_step_card(
         st.markdown('<p class="sf-picked empty">대화 미선택</p>', unsafe_allow_html=True)
 
 
+def _count_selected_steps() -> int:
+    """선택된 Step 수."""
+    flow = st.session_state.get("step_flow", {})
+    return sum(
+        1 for key in ("step1", "step2", "step3")
+        if flow.get(key) and flow[key] != FLOW_NONE
+    )
+
+
+def _render_data_flow_preview() -> None:
+    """선택된 대화들의 데이터 흐름 미리보기."""
+    flow = st.session_state.step_flow
+    selected_count = _count_selected_steps()
+    if selected_count < 1:
+        return
+
+    flow_result = prepare_flow_execution(
+        flow,
+        list(STEP_DEFS),
+    )
+
+    valid_steps = [s for s in flow_result.steps if s.is_valid()]
+    if not valid_steps:
+        return
+
+    with st.expander("📊 데이터 흐름 미리보기", expanded=False):
+        flow_html = build_data_flow_html(valid_steps)
+        if flow_html:
+            st.markdown(flow_html, unsafe_allow_html=True)
+
+        for ctx in valid_steps:
+            st.caption(f"**{ctx.step_label}**: {ctx.user_prompt[:80]}{'…' if len(ctx.user_prompt) > 80 else ''}")
+            if ctx.data_flow.operations:
+                st.caption(f"  연산: {', '.join(ctx.data_flow.operations[:4])}")
+
+
 def render_step_flow_sidebar(saved_chats: list[dict]) -> None:
     """전체 Step Flow / Skill 섹션 (사이드바)."""
     init_step_flow_state()
@@ -258,7 +344,8 @@ def render_step_flow_sidebar(saved_chats: list[dict]) -> None:
     chat_options = get_saved_chat_options(saved_chats)
     label_map = _chat_label_map(saved_chats, chat_options)
 
-    _render_flowchart_nodes(st.session_state.step_flow)
+    running_step = st.session_state.get("flow_running_step", "")
+    _render_flowchart_nodes(st.session_state.step_flow, running_step=running_step)
 
     if not saved_chats:
         st.caption("저장된 대화가 없습니다.")
@@ -266,13 +353,120 @@ def render_step_flow_sidebar(saved_chats: list[dict]) -> None:
         for step_key, step_label, desc in STEP_DEFS:
             render_step_card(step_key, step_label, desc, chat_options, label_map)
 
-    st.caption("저장된 대화에서 Step을 고른 뒤 불러오기 → 다음 Step으로 이어갑니다.")
+    # 데이터 흐름 미리보기
+    _render_data_flow_preview()
 
-    if st.button("▶ Flow 실행 (준비 중)", key="step_flow_run_btn", use_container_width=True):
-        st.info("Flow 실행 기능은 다음 단계에서 구현 예정입니다.")
+    selected_count = _count_selected_steps()
+    flow_in_progress = st.session_state.get("_flow_current_step_idx") is not None
+    can_run = selected_count >= 2
+
+    if flow_in_progress:
+        _render_flow_progress_buttons(selected_count)
+    else:
+        st.caption("저장된 대화에서 Step을 고른 뒤 ▶ Flow 실행을 누르세요.")
+
+        if st.button(
+            f"▶ Flow 실행 ({selected_count}/3 Step 선택됨)",
+            key="step_flow_run_btn",
+            use_container_width=True,
+            disabled=not can_run,
+            type="primary" if can_run else "secondary",
+        ):
+            st.session_state["_flow_current_step_idx"] = 0
+            st.session_state["_flow_execute_requested"] = True
+            st.rerun()
+
+        if not can_run and selected_count > 0:
+            st.caption("최소 2개 Step을 선택해야 Flow를 실행할 수 있습니다.")
+
+    # Flow 실행 결과가 있으면 표시
+    flow_result = st.session_state.get("_flow_last_result")
+    if flow_result and isinstance(flow_result, dict):
+        _render_flow_result_summary(flow_result)
+
+
+def _render_flow_progress_buttons(total_selected: int) -> None:
+    """Flow 진행 중 — 다음 Step / 완료 / 중단 버튼."""
+    current_idx = st.session_state.get("_flow_current_step_idx", 0)
+    valid_cache = st.session_state.get("_flow_valid_steps_cache", [])
+    total_valid = len(valid_cache) if valid_cache else total_selected
+
+    if current_idx < total_valid:
+        step_num = current_idx + 1
+        st.success(f"Step {current_idx}/{total_valid} 완료")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(
+                f"▶ Step {step_num} 실행",
+                key="step_flow_next_btn",
+                use_container_width=True,
+                type="primary",
+            ):
+                st.session_state["_flow_execute_requested"] = True
+                st.rerun()
+        with c2:
+            if st.button(
+                "⏹ Flow 중단",
+                key="step_flow_stop_btn",
+                use_container_width=True,
+            ):
+                _reset_flow_state()
+                st.rerun()
+    else:
+        st.success(f"✅ 전체 {total_valid} Step 완료!")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(
+                "📊 흐름 요약",
+                key="step_flow_summary_btn",
+                use_container_width=True,
+                type="primary",
+            ):
+                st.session_state["_flow_execute_requested"] = True
+                st.rerun()
+        with c2:
+            if st.button(
+                "🔄 새 Flow",
+                key="step_flow_reset_btn",
+                use_container_width=True,
+            ):
+                _reset_flow_state()
+                st.rerun()
+
+
+def _reset_flow_state() -> None:
+    """Flow 실행 상태 초기화."""
+    st.session_state.pop("_flow_current_step_idx", None)
+    st.session_state.pop("_flow_valid_steps_cache", None)
+    st.session_state.pop("flow_running_step", None)
+    st.session_state.pop("_flow_last_result", None)
+
+
+def _render_flow_result_summary(result: dict[str, Any]) -> None:
+    """Flow 실행 완료 후 요약 표시."""
+    with st.expander("✅ Flow 실행 결과", expanded=True):
+        steps = result.get("steps", [])
+        for step_info in steps:
+            status_icon = "✅" if step_info.get("status") == "completed" else "⏭️"
+            st.markdown(
+                f"**{status_icon} {step_info.get('step_label', '')}**"
+            )
+            if step_info.get("prompt_preview"):
+                st.caption(f"요청: {step_info['prompt_preview'][:100]}")
+            if step_info.get("result_preview"):
+                st.caption(f"결과: {step_info['result_preview']}")
+
+        if result.get("data_flow_md"):
+            st.markdown(result["data_flow_md"])
 
 
 def get_step_flow_selection() -> dict[str, Any]:
     """실행 단계 연동용 — 현재 Step Flow 선택 스냅샷."""
     init_step_flow_state()
     return dict(st.session_state.step_flow)
+
+
+# 하위 호환
+render_step_flow_section = render_step_flow_sidebar
