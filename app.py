@@ -686,7 +686,7 @@ from ui.dashboard import (
 )
 from ui.persona_ui import render_enhanced_prompt_preview, render_persona_sidebar
 from ui.saved_chats import render_saved_chats_section
-from ui.step_flow import init_step_flow_state, render_step_flow_sidebar
+from ui.step_flow import init_step_flow_state, render_step_flow_sidebar, STEP_DEFS as FLOW_STEP_DEFS
 from services.prompt_enhancer import _asks_merge, _asks_per_file, detect_intent, enhance as enhance_prompt
 
 ensure_personas_file()
@@ -1240,6 +1240,49 @@ def extract_code_block(text: str) -> str:
     return "\n".join(code_lines).strip()
 
 
+def _sanitize_llm_excel_reads(code: str, filenames: list[str]) -> tuple[str, bool]:
+    """
+    LLM이 pd.read_excel/read_csv를 다시 호출한 코드를 메모리 DataFrame 참조로 교체.
+
+    샌드박스에는 원본 파일이 없고 df_0, df_1...만 주입되므로
+    FileNotFoundError를 방지하기 위해 안전한 형태로 보정합니다.
+    """
+    replaced = False
+    out = code
+    for i, fname in enumerate(filenames):
+        alias = f"df_{i}"
+        # df_x = pd.read_excel('file.xlsx') / "file.xlsx" 패턴
+        assign_pat = re.compile(
+            rf"^\s*([A-Za-z_]\w*)\s*=\s*pd\.(read_excel|read_csv)\(\s*['\"]{re.escape(fname)}['\"].*?\)\s*$",
+            re.MULTILINE,
+        )
+
+        def _assign_sub(m: re.Match[str]) -> str:
+            nonlocal replaced
+            replaced = True
+            lhs = m.group(1)
+            return f"{lhs} = {alias}.copy()"
+
+        out = assign_pat.sub(_assign_sub, out)
+
+        # 단독 호출 pd.read_excel('file.xlsx') 도 치환
+        call_pat = re.compile(
+            rf"pd\.(read_excel|read_csv)\(\s*['\"]{re.escape(fname)}['\"].*?\)"
+        )
+        if call_pat.search(out):
+            replaced = True
+            out = call_pat.sub(f"{alias}.copy()", out)
+
+    # 여전히 read_excel/read_csv가 남아있으면 주석으로 경고 라인 추가
+    if re.search(r"pd\.(read_excel|read_csv)\(", out):
+        replaced = True
+        out = (
+            "# NOTE: 파일 재읽기 코드는 샌드박스에서 실패하므로 df_0, df_1...을 사용해야 합니다.\n"
+            + out
+        )
+    return out, replaced
+
+
 def _excel_codegen_flags(user_prompt: str) -> dict[str, bool]:
     msg_lower = user_prompt.lower()
     allow_merge = _asks_merge(msg_lower)
@@ -1262,14 +1305,36 @@ def generate_excel_code_only(
     max_retries: int = 2,
     on_progress: Callable[[str], None] | None = None,
     use_stream: bool = True,
+    persona_plan: Any | None = None,
+    preloaded_frames: dict[str, pd.DataFrame] | None = None,
+    preloaded_data_context: str | None = None,
 ) -> dict[str, Any]:
-    """코드만 생성 (실행 전). builtin은 즉시 실행 결과 포함."""
+    """코드만 생성 (실행 전). builtin·Persona 도구 경로 포함."""
+    from src.prompt_builder import build_code_generation_prompt
+
     steps = list(thinking_steps or [])
-    if on_progress:
-        on_progress("📂 첨부 Excel 파일 읽는 중…")
-    data_context, frames = build_data_context(filenames)
+    if preloaded_frames is not None:
+        frames = preloaded_frames
+        data_context = preloaded_data_context or ""
+    else:
+        if on_progress:
+            on_progress("📂 첨부 Excel 파일 읽는 중…")
+        data_context, frames = build_data_context(filenames)
     if not frames:
         return {"error": "첨부된 파일을 읽을 수 없습니다.", "thinking_steps": steps}
+
+    if persona_plan and getattr(persona_plan, "tool_formatted_markdown", None):
+        if persona_plan.execution_path == "tool_response":
+            steps.extend(persona_plan.thinking_steps)
+            steps.append(empty_trace_step("응답 생성", "Persona 도구 결과 → 템플릿 출력 (LLM 생략)"))
+            return {
+                "direct_content": persona_plan.tool_formatted_markdown,
+                "frames": frames,
+                "filenames": filenames,
+                "thinking_steps": steps,
+                "ollama_calls": [],
+                "code_source": "persona_tools",
+            }
 
     steps.append(empty_trace_step("데이터 로드", f"{len(frames)}개 DataFrame · 컨텍스트 생성"))
     if on_progress:
@@ -1309,16 +1374,27 @@ def generate_excel_code_only(
 
     for attempt in range(attempts):
         steps.append(empty_trace_step("코드 생성 LLM", f"시도 {attempt + 1}/{attempts}"))
-        code_prompt = generate_code_prompt(
-            user_prompt,
-            data_context,
-            list(frames.keys()),
-            frames=frames,
-            prev_error=prev_error,
-            per_file_mode=flags["per_file_mode"],
-            allow_merge=flags["allow_merge"],
-            allow_chart=flags["allow_chart"],
-        )
+        if persona_plan and getattr(persona_plan, "profile", None):
+            code_prompt = build_code_generation_prompt(
+                persona_plan.profile,
+                user_prompt,
+                data_context,
+                intent=persona_plan.strategy.intent,
+                tool_context=persona_plan.tool_results,
+                flags=flags,
+                prev_error=prev_error,
+            )
+        else:
+            code_prompt = generate_code_prompt(
+                user_prompt,
+                data_context,
+                list(frames.keys()),
+                frames=frames,
+                prev_error=prev_error,
+                per_file_mode=flags["per_file_mode"],
+                allow_merge=flags["allow_merge"],
+                allow_chart=flags["allow_chart"],
+            )
         try:
             if on_progress:
                 on_progress(f"🤖 코드 생성 LLM ({model}) — 시도 {attempt + 1}/{attempts}")
@@ -1344,6 +1420,9 @@ def generate_excel_code_only(
                 "thinking_steps": steps,
                 "ollama_calls": ollama_calls,
             }
+        code, sanitized = _sanitize_llm_excel_reads(code, filenames)
+        if sanitized:
+            steps.append(empty_trace_step("코드 보정", "pd.read_excel/read_csv → 메모리 df 참조로 변환"))
         last_code = code
         steps.append(empty_trace_step("코드 추출", f"{len(code.splitlines())}줄"))
         steps.append(empty_trace_step("실행 대기", "사용자 승인 후 샌드박스 실행"))
@@ -1544,6 +1623,126 @@ def dataframe_to_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Step Flow — Step별 개별 실행
+# ══════════════════════════════════════════════════════════════════════════════
+
+def handle_flow_execution() -> bool:
+    """Step Flow 실행 요청 처리 — 한 번에 한 Step만 실행."""
+    if not st.session_state.pop("_flow_execute_requested", False):
+        return False
+
+    from services.step_flow_engine import (
+        build_data_flow_summary,
+        get_step_prompt_with_context,
+        prepare_flow_execution,
+    )
+
+    flow_sel = dict(st.session_state.get("step_flow", {}))
+    flow_result = prepare_flow_execution(
+        flow_sel,
+        list(FLOW_STEP_DEFS),
+        results_dir=RESULTS_DIR,
+    )
+
+    if flow_result.status == "no_valid_steps":
+        st.warning("유효한 Step이 없습니다. 저장된 대화를 선택해 주세요.")
+        return True
+
+    valid_steps = [s for s in flow_result.steps if s.is_valid()]
+    if not valid_steps:
+        st.warning("선택된 대화에서 유효한 내용을 추출할 수 없습니다.")
+        return True
+
+    # Flow 상태 초기화 또는 이어서 실행
+    current_idx = st.session_state.get("_flow_current_step_idx", 0)
+
+    if current_idx >= len(valid_steps):
+        # 모든 Step 완료 — 최종 요약
+        data_flow_md = build_data_flow_summary(valid_steps)
+        step_summary = " → ".join(f"**{s.step_label}**" for s in valid_steps)
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": (
+                f"✅ **Step Flow 전체 완료**\n\n"
+                f"실행 경로: {step_summary}\n\n"
+                f"{data_flow_md}"
+            ),
+            "trace": {"status": "flow_completed", "flow_steps": len(valid_steps)},
+        })
+        # Flow 상태 정리
+        st.session_state.pop("_flow_current_step_idx", None)
+        st.session_state.pop("_flow_valid_steps_cache", None)
+        st.session_state.pop("flow_running_step", None)
+        st.session_state["_flow_last_result"] = {
+            "steps": [{"step_label": s.step_label, "status": "completed"} for s in valid_steps],
+            "data_flow_md": data_flow_md,
+        }
+        return True
+
+    # 현재 Step 실행
+    step_ctx = valid_steps[current_idx]
+    st.session_state["flow_running_step"] = step_ctx.step_id
+
+    # 이전 Step 컨텍스트 포함 프롬프트 생성
+    enhanced_prompt = get_step_prompt_with_context(
+        current_idx,
+        valid_steps,
+    )
+
+    if not enhanced_prompt:
+        st.session_state["_flow_current_step_idx"] = current_idx + 1
+        st.session_state["_flow_execute_requested"] = True
+        return True
+
+    # Flow 시작 안내 (첫 Step일 때만)
+    if current_idx == 0:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": (
+                f"🔗 **Step Flow 시작** — {len(valid_steps)}개 Step을 순서대로 실행합니다.\n\n"
+                f"각 Step 완료 후 사이드바에서 **▶ 다음 Step**을 눌러 이어갈 수 있습니다."
+            ),
+            "trace": {"status": "flow_start", "flow_steps": len(valid_steps)},
+        })
+
+    # 컨텍스트 정보 표시
+    context_note = ""
+    if current_idx > 0:
+        prev_labels = [s.step_label for s in valid_steps[:current_idx]]
+        context_note = f"\n\n> 📎 이전 단계 반영: {', '.join(prev_labels)}"
+
+    # 유효한 Step 캐시 저장 (다음 Step 실행 시 재사용)
+    import dataclasses
+    st.session_state["_flow_valid_steps_cache"] = [
+        dataclasses.asdict(s) for s in valid_steps
+    ]
+    st.session_state["_flow_current_step_idx"] = current_idx + 1
+
+    # pending_prompt에 프롬프트를 넣어서 일반 채팅 파이프라인으로 실행
+    flow_header = f"**[{step_ctx.step_label} · Flow]** "
+    st.session_state.pending_prompt = enhanced_prompt
+    st.session_state["_flow_step_header"] = (
+        f"{flow_header}{step_ctx.user_prompt[:120]}{context_note}"
+    )
+
+    return True
+
+
+def _inject_flow_step_header() -> None:
+    """Flow Step 실행 시 채팅에 Step 헤더를 표시합니다."""
+    header = st.session_state.pop("_flow_step_header", "")
+    if header:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": header,
+            "trace": {
+                "status": "flow_step_header",
+                "flow_step": st.session_state.get("flow_running_step", ""),
+            },
+        })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 메시지 포맷팅
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1647,8 +1846,12 @@ def _prepare_enhancement(
     persona_id: str,
     use_enh: bool,
     custom_sp: str,
+    frames: dict[str, pd.DataFrame] | None = None,
+    files_meta: list[dict] | None = None,
 ) -> tuple[str, str, dict, list[dict[str, str]], PersonaRecord | Any, str]:
-    """enhanced_prompt, info, meta, thinking_steps, persona_rec, system_prompt."""
+    """Persona 맞춤 파이프라인 — structured prompt · 도구 실행 · 메타."""
+    from src.persona_pipeline import prepare_persona_execution
+
     steps: list[dict[str, str]] = []
     persona_rec = get_selected_persona(persona_id)
     system_prompt = ""
@@ -1660,49 +1863,30 @@ def _prepare_enhancement(
         persona = get_persona(persona_id)
         system_prompt = custom_sp.strip() or persona.system_prompt
         steps.append(empty_trace_step("프롬프트 보강", "OFF — 기본 system prompt 사용"))
+        st.session_state.pop("persona_execution_plan", None)
         return enhanced_prompt, enhancement_info, enhancement_meta, steps, persona_rec, system_prompt
 
-    files_meta = _build_files_metadata(attached) if attached else []
-    steps.append(empty_trace_step("페르소나 로드", f"{persona_rec.emoji} {persona_rec.name}"))
-    if custom_sp.strip():
-        persona_rec = PersonaRecord(
-            id=persona_rec.id,
-            name=persona_rec.name,
-            emoji=persona_rec.emoji,
-            description=persona_rec.description,
-            system_prompt=custom_sp.strip(),
-            response_style=persona_rec.response_style,
-            tools=persona_rec.tools,
-            task_hints=persona_rec.task_hints,
-            builtin=persona_rec.builtin,
-            created_at=persona_rec.created_at,
-            updated_at=persona_rec.updated_at,
-        )
-    if attached:
-        enh = enhance_prompt(
-            user_message=prompt,
-            persona_id=persona_id,
-            files_metadata=files_meta,
-            custom_system_prompt=custom_sp if custom_sp.strip() else None,
-        )
-        enhanced_prompt = enh["enhanced_prompt"]
-        enhancement_info = enh["enhancement_log"]
-        enhancement_meta = {
-            "persona_emoji": persona_rec.emoji,
-            "persona_name": persona_rec.name,
-            "detected_intent": enh["detected_intent"],
-        }
-        steps.append(empty_trace_step("의도 감지", enh["detected_intent"]))
-        steps.append(empty_trace_step("프롬프트 보강", "첨부 파일 메타 + Persona 블록 결합"))
-    else:
-        enhanced_prompt = build_enhanced_prompt(prompt, persona_rec, files_metadata=files_meta)
-        enhancement_meta = build_enhancement_meta(prompt, persona_rec, files_metadata=files_meta)
-        enhancement_info = (
-            f"페르소나: {persona_rec.emoji} {persona_rec.name} | "
-            f"의도: {enhancement_meta.get('detected_intent', '')}"
-        )
-        steps.append(empty_trace_step("의도 감지", enhancement_meta.get("detected_intent", "")))
-        steps.append(empty_trace_step("프롬프트 보강", "Persona enhanced prompt 생성"))
+    files_meta = files_meta if files_meta is not None else (
+        _build_files_metadata(attached) if attached else []
+    )
+    plan = prepare_persona_execution(
+        prompt,
+        persona_id,
+        filenames=list(attached),
+        frames=frames or {},
+        files_metadata=files_meta,
+        custom_system_prompt=custom_sp,
+        use_enhancement=True,
+    )
+    st.session_state.persona_execution_plan = plan
+    persona_rec = plan.profile.record
+    enhanced_prompt = plan.preview_text
+    enhancement_info = plan.enhancement_log
+    enhancement_meta = plan.enhancement_meta
+    system_prompt = persona_rec.system_prompt
+
+    for s in plan.thinking_steps:
+        steps.append(empty_trace_step(s.get("label", ""), s.get("detail", "")))
 
     st.session_state.last_enhanced_prompt = enhanced_prompt
     st.session_state.last_enhancement_meta = enhancement_meta
@@ -1838,6 +2022,8 @@ def process_message(prompt: str) -> None:
     custom_sp = st.session_state.get("custom_system_prompt", "")
     st.session_state.last_user_prompt = prompt
 
+    files_meta = _build_files_metadata(attached)
+    _data_ctx, _frames = build_data_context(attached)
     enhanced_prompt, enhancement_info, enhancement_meta, think_steps, persona_rec, system_prompt = (
         _prepare_enhancement(
             prompt,
@@ -1845,8 +2031,11 @@ def process_message(prompt: str) -> None:
             persona_id=persona_id,
             use_enh=use_enh,
             custom_sp=custom_sp,
+            frames=_frames,
+            files_meta=files_meta,
         )
     )
+    persona_plan = st.session_state.get("persona_execution_plan")
     if not use_enh:
         st.session_state.pop("last_enhanced_prompt", None)
 
@@ -1937,6 +2126,9 @@ def process_message(prompt: str) -> None:
                                 pipeline_st.write(m),
                             ),
                             use_stream=not fast_builtin,
+                            persona_plan=persona_plan,
+                            preloaded_frames=_frames,
+                            preloaded_data_context=_data_ctx,
                         )
                         for msg in progress_updates:
                             pipeline_st.write(msg)
@@ -1948,6 +2140,18 @@ def process_message(prompt: str) -> None:
                     if gen.get("error"):
                         assistant_trace["status"] = "error"
                         _append_assistant_turn(f"⚠️ {gen['error']}", assistant_trace)
+                        return
+
+                    if gen.get("direct_content"):
+                        assistant_trace.update({
+                            "thinking_steps": gen.get("thinking_steps", think_steps),
+                            "status": "completed",
+                            "code_source": "persona_tools",
+                            "pipeline_stage": "complete",
+                        })
+                        render_execution_trace(assistant_trace, expanded=True)
+                        st.markdown(gen["direct_content"], unsafe_allow_html=True)
+                        _append_assistant_turn(gen["direct_content"], assistant_trace)
                         return
 
                     calls = list(gen.get("ollama_calls") or [])
@@ -2368,12 +2572,18 @@ messages: list[dict] = st.session_state.get("messages", [])
 pending: str = st.session_state.get("pending_prompt", "")
 pending_excel = st.session_state.get("pending_excel_run")
 
+if st.session_state.get("_flow_execute_requested"):
+    if handle_flow_execution():
+        st.rerun()
+
 if st.session_state.get("_excel_confirm_action"):
     if handle_pending_excel_action():
         st.rerun()
 
 if pending:
     st.session_state.pending_prompt = ""
+    _inject_flow_step_header()
+    messages = st.session_state.get("messages", [])
     for msg in messages:
         with st.chat_message(msg["role"]):
             render_message_with_trace(msg)

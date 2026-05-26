@@ -132,21 +132,26 @@ def enhance(
     else:
         prompt_source = persona.name
 
-    from services.persona_prompt import build_enhanced_prompt
+    from src.persona_pipeline import prepare_persona_execution
 
     intent = detect_intent(user_message)
-    enhanced_full = build_enhanced_prompt(
-        user_message,
-        persona,
+    fn = [m.get("name", "") for m in (files_metadata or []) if m.get("name")]
+    plan = prepare_persona_execution(
+        user_message.strip(),
+        persona_id,
+        filenames=fn,
+        frames={},
         files_metadata=files_metadata,
-        include_intent_hint=True,
+        custom_system_prompt=custom_system_prompt or "",
+        use_enhancement=True,
     )
-
+    enhanced_full = plan.preview_text
     intent_label = _INTENT_LABELS.get(intent, intent)
-    log_parts = [f"페르소나: {persona.emoji} {prompt_source}"]
-    log_parts.append(f"의도: {intent_label}")
+    log_parts = [plan.enhancement_log or f"페르소나: {persona.emoji} {prompt_source}"]
+    if not plan.enhancement_log:
+        log_parts.append(f"의도: {intent_label}")
     if files_metadata:
-        log_parts.append(f"파일 {len(files_metadata)}개 컨텍스트 추가")
+        log_parts.append(f"파일 {len(files_metadata)}개")
 
     return {
         "enhanced_system_prompt": enhanced_full,
@@ -154,4 +159,6 @@ def enhance(
         "refined_user_message": user_message.strip(),
         "detected_intent": intent,
         "enhancement_log": " | ".join(log_parts),
+        "persona_plan_meta": plan.enhancement_meta,
+        "execution_path": plan.execution_path,
     }
