@@ -38,6 +38,9 @@ class PersonaExecutionPlan:
     execution_path: str = "llm_codegen"
     tool_formatted_markdown: str | None = None
     thinking_steps: list[dict[str, str]] = field(default_factory=list)
+    original_preview: str = ""
+    rewrite_used_llm: bool = False
+    rewrite_elapsed_ms: float = 0.0
 
     def codegen_persona_addon(self) -> str:
         """generate_code_prompt 에 추가할 Persona 블록."""
@@ -60,6 +63,8 @@ def prepare_persona_execution(
     files_metadata: list[dict] | None = None,
     custom_system_prompt: str = "",
     use_enhancement: bool = True,
+    rewrite_model: str = "",
+    use_rewrite: bool = True,
 ) -> PersonaExecutionPlan:
     """
     첨부 파일이 있을 때 Persona 파이프라인 전체를 준비합니다.
@@ -110,7 +115,31 @@ def prepare_persona_execution(
         task_hint=task_hint,
     )
 
-    preview = sections_to_preview_text(sections)
+    fallback_preview = sections_to_preview_text(sections)
+    rewrite_used_llm = False
+    rewrite_elapsed_ms = 0.0
+
+    if use_enhancement and use_rewrite and rewrite_model:
+        from services.prompt_rewriter import rewrite_prompt
+
+        rr = rewrite_prompt(sections, model=rewrite_model, fallback_text=fallback_preview)
+        preview = rr.rewritten_prompt
+        rewrite_used_llm = rr.used_llm
+        if rr.ollama_result:
+            rewrite_elapsed_ms = rr.ollama_result.elapsed_ms
+        if rr.used_llm:
+            steps.append({
+                "label": "프롬프트 리라이트",
+                "detail": f"LLM 완료 ({rewrite_elapsed_ms:.0f}ms)",
+            })
+        elif rr.error:
+            steps.append({
+                "label": "프롬프트 리라이트",
+                "detail": f"폴백 — {rr.error}",
+            })
+    else:
+        preview = fallback_preview
+
     tool_md: str | None = None
     if strategy.execution_path == "tool_response" and tool_results:
         tool_md = format_tool_response(profile, tool_results, user_prompt=user_prompt)
@@ -134,6 +163,9 @@ def prepare_persona_execution(
     if tool_results:
         log_parts.append(f"도구: {', '.join(tool_results.keys())}")
 
+    if rewrite_used_llm:
+        log_parts.append("리라이트: LLM")
+
     return PersonaExecutionPlan(
         profile=profile,
         strategy=strategy,
@@ -146,4 +178,7 @@ def prepare_persona_execution(
         execution_path=strategy.execution_path,
         tool_formatted_markdown=tool_md,
         thinking_steps=steps,
+        original_preview=fallback_preview,
+        rewrite_used_llm=rewrite_used_llm,
+        rewrite_elapsed_ms=rewrite_elapsed_ms,
     )
