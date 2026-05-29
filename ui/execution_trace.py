@@ -32,6 +32,38 @@ def merge_trace_metrics(trace: dict[str, Any], *, extra_ms: float = 0) -> dict[s
     return out
 
 
+def format_trace_metrics_line(trace: dict[str, Any] | None) -> str | None:
+    """결과 하단에 표시할 실행 시간·토큰 한 줄."""
+    if not trace:
+        return None
+    parts: list[str] = []
+    elapsed = trace.get("elapsed_ms")
+    if elapsed is not None:
+        ms = float(elapsed)
+        if ms >= 1000:
+            parts.append(f"⏱ {ms / 1000:.1f}초")
+        elif ms > 0:
+            parts.append(f"⏱ {ms:.0f}ms")
+    tok = trace.get("tokens") or {}
+    prompt = int(tok.get("prompt") or 0)
+    comp = int(tok.get("completion") or 0)
+    total = int(tok.get("total") or prompt + comp)
+    if total > 0 or prompt > 0 or comp > 0:
+        parts.append(f"토큰 {total:,} (prompt {prompt:,} / completion {comp:,})")
+    elif trace.get("code_source") in ("template", "persona_tools"):
+        parts.append("LLM 미사용 (템플릿·도구)")
+    if not parts:
+        return None
+    return " · ".join(parts)
+
+
+def render_trace_metrics_footer(trace: dict[str, Any] | None) -> None:
+    """응답 본문 아래 — 실행 시간·토큰 (항상 표시)."""
+    line = format_trace_metrics_line(trace)
+    if line:
+        st.caption(line)
+
+
 def model_wait_hint(model: str) -> None:
     """대형 모델 대기 안내."""
     m = (model or "").lower()
@@ -185,17 +217,18 @@ def render_execution_trace(trace: dict[str, Any] | None, *, expanded: bool = Tru
 
 
 def render_message_with_trace(msg: dict[str, Any]) -> None:
-    """채팅 버블 — trace + 본문."""
+    """채팅 버블 — 본문 → 메트릭 → 상세 trace."""
     trace = msg.get("trace")
+    content = msg.get("content") or ""
+    if content:
+        st.markdown(content, unsafe_allow_html=True)
     if trace and msg.get("role") == "assistant":
+        render_trace_metrics_footer(trace)
         render_execution_trace(trace, expanded=msg.get("trace_expanded", False))
     elif trace and msg.get("role") == "user" and trace.get("enhanced_prompt"):
         with st.expander("입력 · 강화 프롬프트", expanded=False):
             st.text(trace.get("user_prompt") or msg.get("content", ""))
             st.code(trace["enhanced_prompt"][:4000], language=None)
-    content = msg.get("content") or ""
-    if content:
-        st.markdown(content, unsafe_allow_html=True)
 
 
 def render_pending_excel_confirm(pending: dict[str, Any]) -> bool:

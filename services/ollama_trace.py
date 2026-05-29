@@ -78,17 +78,20 @@ def iter_ollama_chat_stream(
     options: dict[str, Any],
     keep_alive: str,
     timeout: int = 600,
+    think: bool | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Ollama /api/chat stream=True 이벤트 yield."""
     import requests
 
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": True,
         "keep_alive": keep_alive,
         "options": options,
     }
+    if think is not None:
+        payload["think"] = think
     with requests.post(
         f"{base_url.rstrip('/')}/api/chat",
         json=payload,

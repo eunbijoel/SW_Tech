@@ -49,6 +49,17 @@ OLLAMA_OPTS_CHAT: dict[str, Any] = {
     "num_ctx": 4096,
 }
 
+# Gemma4 등 thinking 모델 — think 미설정 시 num_predict가 추론에만 쓰이고 content가 비는 경우 있음
+_THINKING_MODEL_HINTS = ("gemma4", "gemma3", "qwen3", "deepseek-r1", "r1")
+
+
+def _ollama_payload_think(model: str, *, force_no_think: bool = False) -> dict[str, Any]:
+    """Ollama /api/chat 의 think 플래그. False면 추론 생략 후 content에 바로 출력."""
+    n = (model or "").lower()
+    if force_no_think or any(h in n for h in _THINKING_MODEL_HINTS):
+        return {"think": False}
+    return {}
+
 # 작은 모델을 먼저 — qwen3-coder:30b 등은 RAM 부족 시 Ollama 500 오류
 PREFERRED_MODELS = [
     "qwen2.5:7b",
@@ -296,7 +307,13 @@ def sidebar_model_notice(
         if has_excel_files:
             return (
                 f"`{model}` — GPU VRAM 충분합니다. "
-                "엑셀 코드 생성은 **qwen2.5:7b** 가 더 빠를 수 있습니다."
+                "엑셀 pandas 코드는 **qwen2.5:7b** · **qwen3-coder** 가 더 안정적입니다. "
+                "(Gemma4는 thinking·용량 때문에 느리거나 빈 응답이 날 수 있음)"
+            )
+        if "gemma4" in model.lower():
+            return (
+                f"`{model}` — thinking 모델입니다. "
+                "엑셀 분석·코드 생성은 **qwen2.5:7b** 권장."
             )
         return None
 
@@ -402,6 +419,7 @@ from ui.execution_trace import (
     render_pipeline_tracker,
     render_message_with_trace,
     render_pending_excel_confirm,
+    render_trace_metrics_footer,
     start_busy_timer,
     stop_busy_timer,
     tokens_dict_from_result,
@@ -421,9 +439,11 @@ def ollama_chat(
         "stream": False,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": opts,
+        **_ollama_payload_think(model),
     }
     t0 = time.perf_counter()
-    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
+    timeout = 600 if is_heavy_ollama_model(model) else 300
+    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=timeout)
     if r.status_code != 200:
         try:
             err_msg = r.json().get("error", r.text)
@@ -640,6 +660,7 @@ def ollama_generate_streamed(
         options=opts,
         keep_alive=OLLAMA_KEEP_ALIVE,
         timeout=600,
+        think=_ollama_payload_think(model, force_no_think=True).get("think"),
     )
     wall = (time.perf_counter() - t0) * 1000
     return consume_ollama_stream(chunks, on_token=on_token, wall_elapsed_ms=wall, model=model)
@@ -659,9 +680,11 @@ def ollama_generate(
         "stream": False,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": opts,
+        **_ollama_payload_think(model, force_no_think=True),
     }
     t0 = time.perf_counter()
-    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=300)
+    timeout = 600 if is_heavy_ollama_model(model) else 300
+    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=timeout)
     if r.status_code != 200:
         try:
             err_msg = r.json().get("error", r.text)
@@ -1221,23 +1244,29 @@ def generate_code_prompt(
     """)
 
 
-def extract_code_block(text: str) -> str:
-    """AI 응답에서 Python 코드 블록을 추출."""
-    patterns = [
-        r"```python\s*\n(.*?)```",
-        r"```\s*\n(.*?)```",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.DOTALL)
-        if m:
-            return m.group(1).strip()
+def extract_code_block(text: str, *, fallback: str = "") -> str:
+    """AI 응답에서 Python 코드 블록을 추출 (Gemma4 thinking 폴백 포함)."""
+    for source in (text, fallback):
+        if not source or not source.strip():
+            continue
+        patterns = [
+            r"```python\s*\n(.*?)```",
+            r"```\s*\n(.*?)```",
+        ]
+        for pat in patterns:
+            m = re.search(pat, source, re.DOTALL)
+            if m:
+                return m.group(1).strip()
 
-    lines = text.strip().split("\n")
-    code_lines = [
-        l for l in lines
-        if not l.startswith("#") or "import" in l or "=" in l
-    ]
-    return "\n".join(code_lines).strip()
+        lines = source.strip().split("\n")
+        code_lines = [
+            l for l in lines
+            if not l.startswith("#") or "import" in l or "=" in l
+        ]
+        joined = "\n".join(code_lines).strip()
+        if joined and ("import " in joined or "result" in joined or "pd." in joined):
+            return joined
+    return ""
 
 
 def _sanitize_llm_excel_reads(code: str, filenames: list[str]) -> tuple[str, bool]:
@@ -1412,7 +1441,7 @@ def generate_excel_code_only(
                 hint = " 사이드바에서 **qwen2.5:7b** 등 작은 모델을 선택하세요."
             return {"error": f"AI 코드 생성 실패: {e}{hint}", "thinking_steps": steps}
 
-        code = extract_code_block(gen.content)
+        code = extract_code_block(gen.content, fallback=gen.thinking)
         if not code:
             return {
                 "error": "AI가 유효한 코드를 생성하지 못했습니다.",
@@ -1931,17 +1960,19 @@ def _complete_excel_run(
     calls = list(pending.get("ollama_calls") or [])
     calls.extend(result.get("ollama_calls") or [])
     metrics = _sum_ollama_calls(calls)
-    sandbox_ms = float(result.get("sandbox_ms") or 0)
-    trace = merge_trace_metrics({
+    codegen_ms = float(
+        pending.get("codegen_elapsed_ms") or pending.get("trace", {}).get("elapsed_ms") or 0
+    )
+    exec_ms = float(result.get("sandbox_ms") or 0)
+    trace = {
         **pending.get("trace", {}),
         "thinking_steps": steps + list(result.get("thinking_steps") or []),
         "generated_code": result.get("code") or pending.get("code"),
         "tokens": metrics["tokens"],
         "thinking": metrics.get("thinking") or pending.get("trace", {}).get("thinking", ""),
         "status": "completed",
-    }, extra_ms=sandbox_ms)
-    if metrics.get("elapsed_ms"):
-        trace["elapsed_ms"] = float(trace.get("elapsed_ms") or 0) + metrics["elapsed_ms"]
+        "elapsed_ms": codegen_ms + exec_ms,
+    }
 
     content = format_result(result)
     chart_bytes = result.get("chart_bytes")
@@ -2143,25 +2174,30 @@ def process_message(prompt: str) -> None:
                         return
 
                     if gen.get("direct_content"):
+                        turn_ms = (time.perf_counter() - t_turn) * 1000
                         assistant_trace.update({
                             "thinking_steps": gen.get("thinking_steps", think_steps),
                             "status": "completed",
                             "code_source": "persona_tools",
                             "pipeline_stage": "complete",
+                            "elapsed_ms": turn_ms,
+                            "tokens": {"prompt": 0, "completion": 0, "total": 0},
                         })
-                        render_execution_trace(assistant_trace, expanded=True)
                         st.markdown(gen["direct_content"], unsafe_allow_html=True)
+                        render_trace_metrics_footer(assistant_trace)
+                        render_execution_trace(assistant_trace, expanded=False)
                         _append_assistant_turn(gen["direct_content"], assistant_trace)
                         return
 
                     calls = list(gen.get("ollama_calls") or [])
                     metrics = _sum_ollama_calls(calls)
+                    codegen_ms = (time.perf_counter() - t_turn) * 1000
                     assistant_trace.update({
                         "generated_code": gen.get("code", ""),
                         "thinking": gen.get("gen_thinking") or metrics.get("thinking", ""),
                         "thinking_steps": gen.get("thinking_steps", think_steps),
                         "tokens": metrics["tokens"],
-                        "elapsed_ms": metrics.get("elapsed_ms", 0),
+                        "elapsed_ms": max(float(metrics.get("elapsed_ms") or 0), codegen_ms),
                         "code_source": gen.get("code_source", "llm"),
                         "pipeline_stage": "confirm",
                     })
@@ -2191,24 +2227,21 @@ def process_message(prompt: str) -> None:
                                 ollama_calls=calls,
                             )
                             auto_st.update(label="실행 완료", state="complete")
-                        sandbox_ms = (time.perf_counter() - t_turn) * 1000
-                        assistant_trace = merge_trace_metrics({
-                            **assistant_trace,
+                        turn_ms = (time.perf_counter() - t_turn) * 1000
+                        assistant_trace.update({
                             "generated_code": gen["code"],
                             "status": "completed",
-                        }, extra_ms=sandbox_ms)
+                            "elapsed_ms": turn_ms,
+                        })
                         if result.get("ollama_calls"):
                             m2 = _sum_ollama_calls(
                                 calls + list(result.get("ollama_calls") or []),
                             )
                             assistant_trace["tokens"] = m2["tokens"]
-                            assistant_trace["elapsed_ms"] = (
-                                float(assistant_trace.get("elapsed_ms") or 0)
-                                + m2["elapsed_ms"]
-                            )
                         content = format_result(result)
-                        render_execution_trace(assistant_trace, expanded=True)
                         st.markdown(content, unsafe_allow_html=True)
+                        render_trace_metrics_footer(assistant_trace)
+                        render_execution_trace(assistant_trace, expanded=False)
                         if result.get("dataframe") is not None:
                             st.session_state["_last_result_df"] = result["dataframe"]
                             render_result_table(result)
@@ -2231,9 +2264,11 @@ def process_message(prompt: str) -> None:
                         "filenames": attached,
                         "ollama_calls": calls,
                         "trace": assistant_trace,
+                        "codegen_elapsed_ms": assistant_trace.get("elapsed_ms", 0),
                     }
                     render_pipeline_tracker("confirm")
                     render_live_progress(assistant_trace)
+                    render_trace_metrics_footer(assistant_trace)
                     render_execution_trace(assistant_trace, expanded=True)
                     st.markdown("### 생성된 Python 코드")
                     st.code(gen["code"], language="python")
@@ -2278,8 +2313,9 @@ def process_message(prompt: str) -> None:
                     "status": "completed",
                 })
                 render_live_progress(assistant_trace)
-                render_execution_trace(assistant_trace, expanded=True)
                 st.markdown(chat_result.content, unsafe_allow_html=True)
+                render_trace_metrics_footer(assistant_trace)
+                render_execution_trace(assistant_trace, expanded=False)
                 _append_assistant_turn(chat_result.content, assistant_trace)
 
             except requests.ConnectionError:

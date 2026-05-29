@@ -34,6 +34,7 @@ def _load_draft(persona: PersonaRecord) -> dict[str, str]:
 def render_enhanced_prompt_preview(
     enhanced_prompt: str,
     meta: dict | None = None,
+    original_preview: str = "",
 ) -> None:
     """강화된 Prompt 미리보기."""
     if not enhanced_prompt:
@@ -49,8 +50,18 @@ def render_enhanced_prompt_preview(
             st.text(meta.get("system_prompt", "")[:1200])
             st.markdown("**Response style**")
             st.caption(meta.get("response_style") or "(없음)")
-        st.markdown("**최종 enhanced prompt**")
-        st.code(enhanced_prompt[:4000], language=None)
+
+        if original_preview and original_preview != enhanced_prompt:
+            tab_rewrite, tab_original = st.tabs(
+                ["🔄 LLM 리라이트", "📋 원본 (섹션 결합)"]
+            )
+            with tab_rewrite:
+                st.code(enhanced_prompt[:4000], language=None)
+            with tab_original:
+                st.code(original_preview[:4000], language=None)
+        else:
+            st.markdown("**최종 enhanced prompt**")
+            st.code(enhanced_prompt[:4000], language=None)
 
 
 def render_persona_sidebar() -> None:
