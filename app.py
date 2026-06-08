@@ -2332,354 +2332,358 @@ def process_message(prompt: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 사이드바
+# 사이드바 · 메인 UI (SW_TECH_BENCHMARK=1 이면 생략)
 # ══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("### Basic SW Technology")
-    st.caption(f"📍 SW_Tech · `{Path(__file__).resolve().name}` · 포트 8502")
-    st.divider()
+if not os.getenv("SW_TECH_BENCHMARK"):
+    # ══════════════════════════════════════════════════════════════════════════════
+    # 사이드바
+    # ══════════════════════════════════════════════════════════════════════════════
+    with st.sidebar:
+        st.markdown("### Basic SW Technology")
+        st.caption(f"📍 SW_Tech · `{Path(__file__).resolve().name}` · 포트 8502")
+        st.divider()
 
-    # ── 모델 선택 (목업 상단) ────────────────────────────────────────────────
-    st.markdown("**모델 선택**")
-    available = ollama_models()
-    if not available:
-        st.warning("Ollama 모델 없음")
-        available = ["(없음)"]
+        # ── 모델 선택 (목업 상단) ────────────────────────────────────────────────
+        st.markdown("**모델 선택**")
+        available = ollama_models()
+        if not available:
+            st.warning("Ollama 모델 없음")
+            available = ["(없음)"]
 
-    current = st.session_state.get("selected_model", "")
-    if not current or current not in available:
-        current = available[0]
-        st.session_state.selected_model = current
+        current = st.session_state.get("selected_model", "")
+        if not current or current not in available:
+            current = available[0]
+            st.session_state.selected_model = current
 
-    st.selectbox(
-        "모델",
-        available,
-        index=available.index(current),
-        key="selected_model",
-        label_visibility="collapsed",
-    )
-    sel = st.session_state.get("selected_model", current)
-    _hw = _cached_snapshot("/", str(PROJECT_ROOT))
-    _notice = sidebar_model_notice(
-        sel,
-        _hw,
-        has_excel_files=bool(st.session_state.get("attached_files")),
-    )
-    if _notice:
-        if "GPU VRAM 충분" in _notice:
-            st.info(_notice)
-        else:
-            st.warning(_notice)
-
-    st.divider()
-
-    # ── 새 대화 ──────────────────────────────────────────────────────────────
-    if st.button("✏️  새 대화", use_container_width=True, type="primary"):
-        st.session_state.messages = []
-        st.session_state.attached_files = []
-        st.session_state.custom_system_prompt = ""
-        st.session_state.chat_session_id = str(uuid.uuid4())
-        st.session_state.active_chat_file = new_live_chat_name(st.session_state.chat_session_id)
-        st.session_state.pending_excel_run = None
-        st.session_state.pop("_last_result_df", None)
-        st.session_state.pop("_last_chart", None)
-        st.session_state.pop("active_flow_step", None)
-        st.session_state.pop("flow_step_next", None)
-        st.session_state.pop("_excel_confirm_action", None)
-        st.session_state.step_flow = {
-            "flow_id": "excel_stepwise",
-            "step1": "",
-            "step2": "",
-            "step3": "",
-        }
-        st.rerun()
-
-    render_persona_sidebar()
-
-    with st.expander("⚙️ 고급 · 엑셀 분석", expanded=False):
-        st.toggle("✨ 프롬프트 보강 (Persona 결합)", value=True, key="use_enhancement")
-        st.caption("끄면 Persona 없이 기존 system prompt + 일반 메시지만 전송합니다.")
-        st.toggle(
-            "⚡ 빠른 모드 (코드만, 설명 LLM 생략)",
-            value=True,
-            key="fast_mode",
-            help="Ollama 호출 1회로 줄여 응답이 훨씬 빨라집니다.",
-        )
-        st.toggle(
-            "▶ 코드 생성 후 자동 실행 (승인 단계 생략)",
-            value=False,
-            key="auto_run_excel_code",
-            help="기본: ⑤ 실행 확인 → ⑥ Python 실행. 켜면 코드 생성 직후 자동 실행합니다.",
-        )
-        if st.button("🔥 모델 GPU 예열", use_container_width=True, key="warmup_btn"):
-            m = st.session_state.get("selected_model", "")
-            if m and m != "(없음)":
-                ollama_warmup(m)
-                st.session_state.ollama_warmed = True
-                st.success(f"예열 완료: {m}")
-            else:
-                st.info("모델을 먼저 선택하세요")
-
-    # ── Excel · 파일 (업로드 / 목록 / 첨부 / 미리보기) ───────────────────────
-    with st.expander("📁 Excel · 파일", expanded=False):
-        uploads = st.file_uploader(
-            "Excel / CSV 업로드",
-            type=["xlsx", "xls", "csv"],
-            accept_multiple_files=True,
+        st.selectbox(
+            "모델",
+            available,
+            index=available.index(current),
+            key="selected_model",
             label_visibility="collapsed",
         )
-        if uploads and st.button("업로드", key="upload_btn"):
-            for uf in uploads:
-                dest = EXCEL_DIR / uf.name
-                dest.write_bytes(uf.getvalue())
-            st.success(f"{len(uploads)}개 파일 저장됨")
+        sel = st.session_state.get("selected_model", current)
+        _hw = _cached_snapshot("/", str(PROJECT_ROOT))
+        _notice = sidebar_model_notice(
+            sel,
+            _hw,
+            has_excel_files=bool(st.session_state.get("attached_files")),
+        )
+        if _notice:
+            if "GPU VRAM 충분" in _notice:
+                st.info(_notice)
+            else:
+                st.warning(_notice)
+
+        st.divider()
+
+        # ── 새 대화 ──────────────────────────────────────────────────────────────
+        if st.button("✏️  새 대화", use_container_width=True, type="primary"):
+            st.session_state.messages = []
+            st.session_state.attached_files = []
+            st.session_state.custom_system_prompt = ""
+            st.session_state.chat_session_id = str(uuid.uuid4())
+            st.session_state.active_chat_file = new_live_chat_name(st.session_state.chat_session_id)
+            st.session_state.pending_excel_run = None
+            st.session_state.pop("_last_result_df", None)
+            st.session_state.pop("_last_chart", None)
+            st.session_state.pop("active_flow_step", None)
+            st.session_state.pop("flow_step_next", None)
+            st.session_state.pop("_excel_confirm_action", None)
+            st.session_state.step_flow = {
+                "flow_id": "excel_stepwise",
+                "step1": "",
+                "step2": "",
+                "step3": "",
+            }
             st.rerun()
 
-        st.markdown("**📂 Excel 파일 목록**")
-        excel_files = list_excel_files()
+        render_persona_sidebar()
 
-        if excel_files:
-            for ef in excel_files:
-                fname = ef["name"]
-                is_attached = fname in st.session_state.attached_files
-                size_str = file_size_fmt(ef["size"])
-                date_str = ef["modified"].strftime("%m/%d %H:%M")
+        with st.expander("⚙️ 고급 · 엑셀 분석", expanded=False):
+            st.toggle("✨ 프롬프트 보강 (Persona 결합)", value=True, key="use_enhancement")
+            st.caption("끄면 Persona 없이 기존 system prompt + 일반 메시지만 전송합니다.")
+            st.toggle(
+                "⚡ 빠른 모드 (코드만, 설명 LLM 생략)",
+                value=True,
+                key="fast_mode",
+                help="Ollama 호출 1회로 줄여 응답이 훨씬 빨라집니다.",
+            )
+            st.toggle(
+                "▶ 코드 생성 후 자동 실행 (승인 단계 생략)",
+                value=False,
+                key="auto_run_excel_code",
+                help="기본: ⑤ 실행 확인 → ⑥ Python 실행. 켜면 코드 생성 직후 자동 실행합니다.",
+            )
+            if st.button("🔥 모델 GPU 예열", use_container_width=True, key="warmup_btn"):
+                m = st.session_state.get("selected_model", "")
+                if m and m != "(없음)":
+                    ollama_warmup(m)
+                    st.session_state.ollama_warmed = True
+                    st.success(f"예열 완료: {m}")
+                else:
+                    st.info("모델을 먼저 선택하세요")
 
-                c1, c2, c3 = st.columns([5, 1, 1])
-                with c1:
-                    icon = "📌" if is_attached else "📄"
-                    st.caption(f"{icon} {fname}  \n  {size_str} · {date_str}")
-                with c2:
-                    if is_attached:
-                        if st.button("➖", key=f"detach_{fname}", help="첨부 해제"):
-                            st.session_state.attached_files.remove(fname)
-                            st.rerun()
-                    else:
-                        if st.button("➕", key=f"attach_{fname}", help="첨부"):
-                            st.session_state.attached_files.append(fname)
-                            st.rerun()
-                with c3:
-                    if st.button("🗑", key=f"del_{fname}", help="삭제"):
-                        (EXCEL_DIR / fname).unlink(missing_ok=True)
-                        if fname in st.session_state.attached_files:
-                            st.session_state.attached_files.remove(fname)
-                        st.rerun()
-        else:
-            st.caption("파일 없음 — 위에서 업로드하세요")
-
-        attached = st.session_state.attached_files
-        st.markdown(f"**📌 첨부 파일 ({len(attached)}개)**")
-        if attached:
-            for fname in attached:
-                st.caption(f"• {fname}")
-        else:
-            st.caption("파일을 ➕로 첨부하세요")
-
-        st.markdown("**👁 파일 미리보기**")
-        preview_options = [ef["name"] for ef in excel_files] if excel_files else []
-        if preview_options:
-            preview_file = st.selectbox(
-                "미리보기 파일",
-                preview_options,
+        # ── Excel · 파일 (업로드 / 목록 / 첨부 / 미리보기) ───────────────────────
+        with st.expander("📁 Excel · 파일", expanded=False):
+            uploads = st.file_uploader(
+                "Excel / CSV 업로드",
+                type=["xlsx", "xls", "csv"],
+                accept_multiple_files=True,
                 label_visibility="collapsed",
             )
-            if preview_file:
-                try:
-                    preview_df = read_excel_smart(str(EXCEL_DIR / preview_file))
-                    st.caption(f"{preview_df.shape[0]}행 × {preview_df.shape[1]}열")
-                    st.dataframe(
-                        preview_df.head(8),
-                        use_container_width=True,
-                        height=160,
-                        hide_index=True,
-                    )
-                except Exception as e:
-                    st.error(f"미리보기 실패: {e}")
-        else:
-            st.caption("미리볼 파일 없음")
-
-    st.divider()
-
-    # ── 내보내기 ─────────────────────────────────────────────────────────────
-    st.markdown("**💾 내보내기**")
-    exp_c1, exp_c2 = st.columns(2)
-    def _snapshot_on_download() -> None:
-        msgs = st.session_state.get("messages") or []
-        if not msgs:
-            return
-        _autosave_messages(msgs)
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        md_path = save_conversation_md(msgs, f"chat_{ts}")
-        st.session_state["_last_saved_chat"] = str(md_path)
-
-    with exp_c1:
-        chat_msgs = st.session_state.get("messages") or []
-        if chat_msgs:
-            export_title = _chat_summary_title(chat_msgs)
-            export_md = messages_to_markdown(chat_msgs, summary_title=export_title)
-            export_name = f"chat_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            st.download_button(
-                "📥 대화 저장",
-                data=export_md.encode("utf-8"),
-                file_name=export_name,
-                mime="text/markdown",
-                use_container_width=True,
-                help="MD 파일 다운로드 + results/ 스냅샷 저장",
-                on_click=_snapshot_on_download,
-                key="download_chat_md",
-            )
-        else:
-            st.button(
-                "📥 대화 저장",
-                disabled=True,
-                use_container_width=True,
-                help="대화가 없습니다",
-            )
-    with exp_c2:
-        last_df = st.session_state.get("_last_result_df")
-        if last_df is not None:
-            st.download_button(
-                "📥 Excel",
-                data=dataframe_to_bytes(last_df),
-                file_name=f"result_{datetime.datetime.now().strftime('%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        else:
-            st.button("📥 Excel", disabled=True, use_container_width=True, help="결과 없음")
-
-    last_chart = st.session_state.get("_last_chart")
-    if last_chart:
-        st.download_button(
-            "📥 차트 (PNG)",
-            data=last_chart,
-            file_name=f"chart_{datetime.datetime.now().strftime('%H%M%S')}.png",
-            mime="image/png",
-            use_container_width=True,
-        )
-
-    if st.session_state.get("_last_saved_chat"):
-        st.success(f"저장됨: `{Path(st.session_state['_last_saved_chat']).name}`")
-
-    st.divider()
-
-    render_busy_timer_fragment()
-
-    saved_chats = list_saved_chats()
-    st.markdown(f"**📜 저장된 대화 ({len(saved_chats)}건)**")
-    render_saved_chats_section(saved_chats, load_fn=load_conversation_md)
-
-    st.divider()
-
-    render_step_flow_sidebar(saved_chats)
-
-    if st.session_state.get("last_enhanced_prompt"):
-        render_enhanced_prompt_preview(
-            st.session_state.last_enhanced_prompt,
-            st.session_state.get("last_enhancement_meta"),
-        )
-
-    st.divider()
-    render_settings_section()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 메인 영역 — 대시보드 + 채팅
-# ══════════════════════════════════════════════════════════════════════════════
-
-render_page_title()
-render_dashboard_top(st.session_state.get("selected_model", ""))
-
-st.markdown("### 채팅")
-
-SUGGESTIONS = [
-    ("📊 파일 구조 분석", "첨부된 엑셀 파일의 컬럼 구조와 데이터 유형을 분석해주세요."),
-    ("🔀 파일 병합", "첨부된 모든 엑셀 파일을 하나로 병합하고, 중복 컬럼은 평균값으로 처리해주세요."),
-    ("📈 예산 집행률", "계획예산 대비 집행계의 집행률(%)을 계산하고 높은 순으로 정렬해주세요."),
-    (
-        "📊 차트 시각화",
-        "비목분류별 계획예산·당해집행으로 집행률(%)을 계산하고, "
-        "집행률 상위 15개만 막대 차트로 그려주세요. "
-        "차트는 dropna로 행 단위 정렬 후 plot_df만 사용하세요.",
-    ),
-]
-
-messages: list[dict] = st.session_state.get("messages", [])
-pending: str = st.session_state.get("pending_prompt", "")
-pending_excel = st.session_state.get("pending_excel_run")
-
-if st.session_state.get("_flow_execute_requested"):
-    if handle_flow_execution():
-        st.rerun()
-
-if st.session_state.get("_excel_confirm_action"):
-    if handle_pending_excel_action():
-        st.rerun()
-
-if pending:
-    st.session_state.pending_prompt = ""
-    _inject_flow_step_header()
-    messages = st.session_state.get("messages", [])
-    for msg in messages:
-        with st.chat_message(msg["role"]):
-            render_message_with_trace(msg)
-    with st.chat_message("user"):
-        st.markdown(pending)
-    process_message(pending)
-
-elif not messages and not pending_excel:
-    st.caption("메시지를 입력하거나, 아래 제안으로 엑셀 분석을 시작하세요. (사이드바에서 파일 ➕ 첨부)")
-
-    col_a, col_b = st.columns(2)
-    for i, (label, prompt_text) in enumerate(SUGGESTIONS):
-        target = col_a if i % 2 == 0 else col_b
-        with target:
-            st.markdown('<div class="chip-col">', unsafe_allow_html=True)
-            if st.button(label, key=f"chip_{i}", use_container_width=True):
-                st.session_state.pending_prompt = prompt_text
+            if uploads and st.button("업로드", key="upload_btn"):
+                for uf in uploads:
+                    dest = EXCEL_DIR / uf.name
+                    dest.write_bytes(uf.getvalue())
+                st.success(f"{len(uploads)}개 파일 저장됨")
                 st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
 
-else:
-    for i, msg in enumerate(messages):
-        is_last = i == len(messages) - 1
-        with st.chat_message(msg["role"]):
-            render_message_with_trace(msg)
-            if (
-                is_last
-                and msg.get("role") == "assistant"
-                and st.session_state.get("_last_result_df") is not None
-            ):
-                render_result_table({
-                    "dataframe": st.session_state["_last_result_df"],
-                    "preview": st.session_state["_last_result_df"].head(TABLE_PREVIEW_ROWS),
-                    "shape": {
-                        "rows": len(st.session_state["_last_result_df"]),
-                        "cols": len(st.session_state["_last_result_df"].columns),
-                    },
-                })
-            if is_last and msg.get("role") == "assistant" and st.session_state.get("_last_chart"):
-                st.image(
-                    st.session_state["_last_chart"],
-                    caption="📈 분석 차트",
+            st.markdown("**📂 Excel 파일 목록**")
+            excel_files = list_excel_files()
+
+            if excel_files:
+                for ef in excel_files:
+                    fname = ef["name"]
+                    is_attached = fname in st.session_state.attached_files
+                    size_str = file_size_fmt(ef["size"])
+                    date_str = ef["modified"].strftime("%m/%d %H:%M")
+
+                    c1, c2, c3 = st.columns([5, 1, 1])
+                    with c1:
+                        icon = "📌" if is_attached else "📄"
+                        st.caption(f"{icon} {fname}  \n  {size_str} · {date_str}")
+                    with c2:
+                        if is_attached:
+                            if st.button("➖", key=f"detach_{fname}", help="첨부 해제"):
+                                st.session_state.attached_files.remove(fname)
+                                st.rerun()
+                        else:
+                            if st.button("➕", key=f"attach_{fname}", help="첨부"):
+                                st.session_state.attached_files.append(fname)
+                                st.rerun()
+                    with c3:
+                        if st.button("🗑", key=f"del_{fname}", help="삭제"):
+                            (EXCEL_DIR / fname).unlink(missing_ok=True)
+                            if fname in st.session_state.attached_files:
+                                st.session_state.attached_files.remove(fname)
+                            st.rerun()
+            else:
+                st.caption("파일 없음 — 위에서 업로드하세요")
+
+            attached = st.session_state.attached_files
+            st.markdown(f"**📌 첨부 파일 ({len(attached)}개)**")
+            if attached:
+                for fname in attached:
+                    st.caption(f"• {fname}")
+            else:
+                st.caption("파일을 ➕로 첨부하세요")
+
+            st.markdown("**👁 파일 미리보기**")
+            preview_options = [ef["name"] for ef in excel_files] if excel_files else []
+            if preview_options:
+                preview_file = st.selectbox(
+                    "미리보기 파일",
+                    preview_options,
+                    label_visibility="collapsed",
+                )
+                if preview_file:
+                    try:
+                        preview_df = read_excel_smart(str(EXCEL_DIR / preview_file))
+                        st.caption(f"{preview_df.shape[0]}행 × {preview_df.shape[1]}열")
+                        st.dataframe(
+                            preview_df.head(8),
+                            use_container_width=True,
+                            height=160,
+                            hide_index=True,
+                        )
+                    except Exception as e:
+                        st.error(f"미리보기 실패: {e}")
+            else:
+                st.caption("미리볼 파일 없음")
+
+        st.divider()
+
+        # ── 내보내기 ─────────────────────────────────────────────────────────────
+        st.markdown("**💾 내보내기**")
+        exp_c1, exp_c2 = st.columns(2)
+        def _snapshot_on_download() -> None:
+            msgs = st.session_state.get("messages") or []
+            if not msgs:
+                return
+            _autosave_messages(msgs)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            md_path = save_conversation_md(msgs, f"chat_{ts}")
+            st.session_state["_last_saved_chat"] = str(md_path)
+
+        with exp_c1:
+            chat_msgs = st.session_state.get("messages") or []
+            if chat_msgs:
+                export_title = _chat_summary_title(chat_msgs)
+                export_md = messages_to_markdown(chat_msgs, summary_title=export_title)
+                export_name = f"chat_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+                st.download_button(
+                    "📥 대화 저장",
+                    data=export_md.encode("utf-8"),
+                    file_name=export_name,
+                    mime="text/markdown",
+                    use_container_width=True,
+                    help="MD 파일 다운로드 + results/ 스냅샷 저장",
+                    on_click=_snapshot_on_download,
+                    key="download_chat_md",
+                )
+            else:
+                st.button(
+                    "📥 대화 저장",
+                    disabled=True,
+                    use_container_width=True,
+                    help="대화가 없습니다",
+                )
+        with exp_c2:
+            last_df = st.session_state.get("_last_result_df")
+            if last_df is not None:
+                st.download_button(
+                    "📥 Excel",
+                    data=dataframe_to_bytes(last_df),
+                    file_name=f"result_{datetime.datetime.now().strftime('%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+            else:
+                st.button("📥 Excel", disabled=True, use_container_width=True, help="결과 없음")
 
-    if pending_excel:
-        with st.chat_message("assistant"):
-            if render_pending_excel_confirm(pending_excel):
-                st.rerun()
+        last_chart = st.session_state.get("_last_chart")
+        if last_chart:
+            st.download_button(
+                "📥 차트 (PNG)",
+                data=last_chart,
+                file_name=f"chart_{datetime.datetime.now().strftime('%H%M%S')}.png",
+                mime="image/png",
+                use_container_width=True,
+            )
 
-# ── 채팅 입력 ────────────────────────────────────────────────────────────────
-_chat_disabled = bool(st.session_state.get("pending_excel_run"))
-if user_input := st.chat_input(
-    "메시지를 입력하세요..." if not _chat_disabled else "코드 실행 확인 후 입력 가능…",
-    disabled=_chat_disabled,
-):
-    with st.chat_message("user"):
-        st.markdown(user_input)
-    process_message(user_input)
-    st.rerun()
+        if st.session_state.get("_last_saved_chat"):
+            st.success(f"저장됨: `{Path(st.session_state['_last_saved_chat']).name}`")
 
-if st.session_state.pop("_rerun_for_pending", False):
-    st.rerun()
+        st.divider()
+
+        render_busy_timer_fragment()
+
+        saved_chats = list_saved_chats()
+        st.markdown(f"**📜 저장된 대화 ({len(saved_chats)}건)**")
+        render_saved_chats_section(saved_chats, load_fn=load_conversation_md)
+
+        st.divider()
+
+        render_step_flow_sidebar(saved_chats)
+
+        if st.session_state.get("last_enhanced_prompt"):
+            render_enhanced_prompt_preview(
+                st.session_state.last_enhanced_prompt,
+                st.session_state.get("last_enhancement_meta"),
+            )
+
+        st.divider()
+        render_settings_section()
+
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # 메인 영역 — 대시보드 + 채팅
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    render_page_title()
+    render_dashboard_top(st.session_state.get("selected_model", ""))
+
+    st.markdown("### 채팅")
+
+    SUGGESTIONS = [
+        ("📊 파일 구조 분석", "첨부된 엑셀 파일의 컬럼 구조와 데이터 유형을 분석해주세요."),
+        ("🔀 파일 병합", "첨부된 모든 엑셀 파일을 하나로 병합하고, 중복 컬럼은 평균값으로 처리해주세요."),
+        ("📈 예산 집행률", "계획예산 대비 집행계의 집행률(%)을 계산하고 높은 순으로 정렬해주세요."),
+        (
+            "📊 차트 시각화",
+            "비목분류별 계획예산·당해집행으로 집행률(%)을 계산하고, "
+            "집행률 상위 15개만 막대 차트로 그려주세요. "
+            "차트는 dropna로 행 단위 정렬 후 plot_df만 사용하세요.",
+        ),
+    ]
+
+    messages: list[dict] = st.session_state.get("messages", [])
+    pending: str = st.session_state.get("pending_prompt", "")
+    pending_excel = st.session_state.get("pending_excel_run")
+
+    if st.session_state.get("_flow_execute_requested"):
+        if handle_flow_execution():
+            st.rerun()
+
+    if st.session_state.get("_excel_confirm_action"):
+        if handle_pending_excel_action():
+            st.rerun()
+
+    if pending:
+        st.session_state.pending_prompt = ""
+        _inject_flow_step_header()
+        messages = st.session_state.get("messages", [])
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                render_message_with_trace(msg)
+        with st.chat_message("user"):
+            st.markdown(pending)
+        process_message(pending)
+
+    elif not messages and not pending_excel:
+        st.caption("메시지를 입력하거나, 아래 제안으로 엑셀 분석을 시작하세요. (사이드바에서 파일 ➕ 첨부)")
+
+        col_a, col_b = st.columns(2)
+        for i, (label, prompt_text) in enumerate(SUGGESTIONS):
+            target = col_a if i % 2 == 0 else col_b
+            with target:
+                st.markdown('<div class="chip-col">', unsafe_allow_html=True)
+                if st.button(label, key=f"chip_{i}", use_container_width=True):
+                    st.session_state.pending_prompt = prompt_text
+                    st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    else:
+        for i, msg in enumerate(messages):
+            is_last = i == len(messages) - 1
+            with st.chat_message(msg["role"]):
+                render_message_with_trace(msg)
+                if (
+                    is_last
+                    and msg.get("role") == "assistant"
+                    and st.session_state.get("_last_result_df") is not None
+                ):
+                    render_result_table({
+                        "dataframe": st.session_state["_last_result_df"],
+                        "preview": st.session_state["_last_result_df"].head(TABLE_PREVIEW_ROWS),
+                        "shape": {
+                            "rows": len(st.session_state["_last_result_df"]),
+                            "cols": len(st.session_state["_last_result_df"].columns),
+                        },
+                    })
+                if is_last and msg.get("role") == "assistant" and st.session_state.get("_last_chart"):
+                    st.image(
+                        st.session_state["_last_chart"],
+                        caption="📈 분석 차트",
+                        use_container_width=True,
+                    )
+
+        if pending_excel:
+            with st.chat_message("assistant"):
+                if render_pending_excel_confirm(pending_excel):
+                    st.rerun()
+
+    # ── 채팅 입력 ────────────────────────────────────────────────────────────────
+    _chat_disabled = bool(st.session_state.get("pending_excel_run"))
+    if user_input := st.chat_input(
+        "메시지를 입력하세요..." if not _chat_disabled else "코드 실행 확인 후 입력 가능…",
+        disabled=_chat_disabled,
+    ):
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        process_message(user_input)
+        st.rerun()
+
+    if st.session_state.pop("_rerun_for_pending", False):
+        st.rerun()

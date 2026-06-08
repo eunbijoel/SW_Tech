@@ -1,0 +1,14 @@
+run_id,case_id,model,mode,persona_id,reviewer_id
+bench_001,execution_rate_sort,qwen2.5:7b,plain,data_analyst,R1
+,,,,,,
+# 아래 1~5 Likert (빈칸=미평가),,,,,,
+context_alignment_expert,맥락 정합성 (파일/컬럼/정책 반영),,,,,
+executability_expert,실행 가능성 (재질문 없이 E2E),,,,,
+verification_expert,검증/출력 계약 충족,,,,,
+safety_expert,안전·정책 준수,,,,,
+human_burden_expert,인간 개입 부담 (낮을수록 5),,,,,
+traceability_expert,추적·재현 가능성,,,,,
+prompt_clarity_expert,강화 프롬프트 명확성 (plain은 원문),,,,,
+usability_sus,사용성 SUS 환산 또는 1~5,,,,,
+user_satisfaction,사용자 만족 (요구 충족),,,,,
+notes,코멘트,,,,,

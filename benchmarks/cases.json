@@ -1,0 +1,60 @@
+{
+  "chat_cases": [
+    {
+      "id": "file_meta_explain",
+      "prompt": "첨부 엑셀에서 실제로 값이 들어 있는 셀 범위(행·열)를 파일별로 요약해줘. 병합이나 집행률 계산은 하지 마.",
+      "persona_id": "excel_expert",
+      "checks": {
+        "must_contain": ["행", "열"],
+        "must_not_contain": ["pd.concat", "집행률"]
+      }
+    },
+    {
+      "id": "kpi_priority",
+      "prompt": "부서별 KPI 관점에서 데이터 품질 이슈 3가지와 실행 우선순위를 제안해줘.",
+      "persona_id": "business_consultant",
+      "checks": {
+        "must_contain": ["KPI", "우선"],
+        "must_not_contain": []
+      }
+    }
+  ],
+  "codegen_cases": [
+    {
+      "id": "execution_rate_sort",
+      "prompt": "계획예산 대비 당해집행의 집행률(%)을 계산하고 높은 순으로 정렬해줘.",
+      "persona_id": "data_analyst",
+      "frames": {
+        "df_0": {
+          "columns": {
+            "비목분류": ["인건비", "연구비", "운영비"],
+            "계획예산": [1000, 500, 800],
+            "당해집행": [600, 400, 200]
+          }
+        }
+      },
+      "checks": {
+        "must_contain": ["집행률", "to_numeric", "result"],
+        "must_not_contain": ["read_excel", "read_csv"]
+      }
+    },
+    {
+      "id": "per_file_range",
+      "prompt": "df_0에서 데이터가 입력된 행·열 범위를 알려줘. 다른 파일 병합은 하지 마.",
+      "persona_id": "excel_expert",
+      "frames": {
+        "df_0": {
+          "columns": {
+            "A": [1, 2, null, null, 5],
+            "B": [null, "x", "y", null, null],
+            "C": [10, 20, 30, 40, 50]
+          }
+        }
+      },
+      "checks": {
+        "must_contain": ["df_0", "result"],
+        "must_not_contain": ["read_excel", "concat"]
+      }
+    }
+  ]
+}
