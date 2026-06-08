@@ -324,41 +324,58 @@ streamlit run app.py --server.port 8502
 
 ```
 SW_Tech/
-├── app.py                          # 메인 Streamlit 앱 (8502)
+├── app.py                          # 메인 Streamlit 앱 (8502) — UI·Ollama·엑셀 실행
 ├── scripts/
-│   └── run_studio.sh               # 실행 스크립트
+│   ├── run_studio.sh               # 실행 스크립트 (streamlit :8502)
+│   └── benchmark_persona.py        # Persona vs regular Chat 벤치마크 CLI
 ├── ui/
 │   ├── dashboard.py                # 시스템 모니터·상단 대시보드
 │   ├── persona_ui.py               # Persona 선택/편집 UI
+│   ├── execution_trace.py          # 실행 시간·토큰·「실행 상세」trace UI
 │   ├── saved_chats.py              # 저장된 대화 + Step 필터
 │   └── step_flow.py                # Step Flow / Skill UI
 ├── src/                            # Persona 맞춤 분석 실행
 │   ├── persona_pipeline.py         # 오케스트레이터
+│   ├── persona_manager.py          # personas.json 로드·프로필 보강
 │   ├── persona_router.py           # 전략·도구·execution_path
 │   ├── tool_registry.py            # excel_analyzer, kpi_summary 등
 │   ├── prompt_builder.py           # 구조화 프롬프트
 │   ├── excel_analyzer.py           # used range 실측
+│   ├── excel_actions.py            # 정제·후속 단계 제안
 │   └── model_router.py             # Persona 템플릿 응답 포맷
 ├── services/
 │   ├── persona_service.py          # 내장 5종 Persona 정의
 │   ├── persona_store.py            # personas.json 로드/저장
 │   ├── persona_prompt.py           # 파이프라인 래퍼
-│   ├── prompt_enhancer.py          # 의도 감지
+│   ├── prompt_enhancer.py          # 의도 감지·파일 컨텍스트
+│   ├── prompt_rewriter.py          # Ollama 프롬프트 리라이트
 │   ├── step_flow_engine.py         # Step 순차 실행·데이터 흐름 추적
 │   ├── conversation_store.py       # MD 저장·trace 복원
 │   ├── chat_catalog.py             # 대화 목록 요약·중복 제거
-│   ├── ollama_trace.py             # 토큰·thinking 메트릭
+│   ├── ollama_trace.py             # Ollama API·토큰·thinking 메트릭
 │   ├── system_diagnostics.py       # GPU/RAM/CPU/디스크/Ollama
 │   └── korean_matplotlib.py        # 한글 차트 폰트
+├── benchmarks/                     # 엑셀 실행 벤치마크·DSR 평가
+│   ├── run_comparison.py           # plain vs persona chat/codegen 비교
+│   ├── _app_loader.py              # 벤치 시 Streamlit UI 스킵용
+│   ├── cases.json                  # 벤치 과제·키워드 규칙
+│   ├── metrics.py                  # instruction_score·runs.csv 집계
+│   ├── dsr_metrics.py            # DSR 6차원 자동 점수
+│   ├── score_saved_chats.py        # 저장 chat_*.md trace 재평가
+│   ├── README.md                   # 벤치 실행·지표 설명
+│   ├── EVALUATION.md               # 논문·정성 평가 가이드
+│   └── human_review_template.csv   # 전문가 Likert 템플릿
 ├── config/
 │   ├── personas.json               # Persona 저장 (편집 반영)
 │   ├── flow_templates.json         # Step Flow 템플릿
 │   ├── chat_step_links.json        # 저장 대화 ↔ Step 매핑
 │   └── custom_personas.json        # (레거시, 최초 마이그레이션용)
-├── excel/                          # 업로드 Excel (.gitignore)
-├── results/                        # chat_*.md 대화 기록 (.gitignore)
-├── tests/unit/
+├── excel/                          # 업로드 Excel (런타임)
+├── results/                        # chat_*.md·벤치 결과 (gitignore)
+├── tests/unit/                     # 단위 테스트
+├── .streamlit/
 ├── requirements.txt
+├── readme_study.md                 # 구조·벤치 결과 정리
 └── README.md
 ```
 
@@ -376,7 +393,8 @@ SW_Tech/
 ---
 
 ## 변경 이력 (요약)
-
+- **2026-06:** 벤치마크 (`benchmarks/`, `scripts/benchmark_persona.py`), 실행 trace UI (`execution_trace.py`), `prompt_rewriter`, `persona_manager`, `readme_study.md`
+- **2026-05-29:** trace 메트릭 footer, gemma4 think=false, Persona 미리보기 탭
 - **2026-05-26:** Persona 실행 파이프라인 (`src/`), Step Flow 순차 실행 (`step_flow_engine`), personas.json 확장 필드, LLM `read_excel` 자동 보정, `results/` gitignore
 - **2026-05-22:** Persona `personas.json` 저장·enhanced prompt 파이프라인, 시스템 모니터 UI, Step Flow/저장 대화, 사이드바 접이식 정리, GPU 기반 대형 모델 안내
 
